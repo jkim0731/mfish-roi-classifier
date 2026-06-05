@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mfish-roi-classifier"
+version = "0.1.0"
+description = "v5d ROI-quality classifier for HCR cell segmentations in mFISH coregistration."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pandas",
+    "scipy",
+    "scikit-image",
+    "zarr",
+    "lightgbm",
+    "scikit-learn",
+    "pyarrow",
+    "tifffile",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+label = [
+    "matplotlib",
+    "ipywidgets",
+    "ipyevents",
+    "IPython",
+]
+
+[project.scripts]
+roi-classifier = "roi_classifier.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"
