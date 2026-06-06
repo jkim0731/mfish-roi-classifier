@@ -38,8 +38,12 @@ PER_CELL_CROPS_DIR = Path(
     os.environ.get("MFISH_PER_CELL_CROPS_DIR", str(CACHE_DIR / "per_cell_crops"))
 )
 
-# Directory that holds trained model text files when different from ROI_QUALITY_DIR.
-# Defaults to ROI_QUALITY_DIR because that is where the train() function writes them.
+# Directory that holds trained model text files.
+# Default: models/ at the repository root (one level above src/), so a fresh
+# clone with models/ committed is immediately runnable without extra env vars.
+# Override with MFISH_MODELS_DIR to point at a different location (e.g. during
+# training where the new models should land in ROI_QUALITY_DIR).
+_REPO_MODELS = Path(__file__).parent.parent.parent / "models"
 MODELS_DIR = Path(
-    os.environ.get("MFISH_MODELS_DIR", str(ROI_QUALITY_DIR))
+    os.environ.get("MFISH_MODELS_DIR", str(_REPO_MODELS))
 )

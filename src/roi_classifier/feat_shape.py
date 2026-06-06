@@ -667,3 +667,9 @@ def extract_roi_features_v2(
     print(f"  [{sid}] v2 meta saved → {_meta_v2_path(sid)}")
 
     return feat_df
+
+
+# Public entry point used by features.extract_features.
+def compute(s: SubjectData, cache: bool = True) -> pd.DataFrame:
+    """Compute (or load from cache) shape + 405 + adjacency features for subject s."""
+    return extract_roi_features_v2(s, cache=cache)

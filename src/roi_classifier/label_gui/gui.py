@@ -74,21 +74,22 @@ SUBJECTS = ["755252", "767018", "767022", "782149", "788406", "790322"]
 HCR_DATA_ROOTS: dict[str, Path] = {}  # populated lazily by `_hcr_dir`
 
 # Display
+# Display features — all members of the consolidated _um (91-col) set.
 KEY_DISPLAY_FEATURES = [
-    "volume_um3",
-    "solidity",
-    "equivalent_diameter_um",
-    "bbox_occupancy",
-    "boundary_touching",
-    "c405_peak_inside",
-    "c405_core_minus_shell_p90",
-    "c405_p90",
-    "c488_p90",
+    "volume_um3_raw",
+    "equivalent_diameter_um_opened",
+    "solidity_opened",
+    "bbox_occupancy_raw",
+    "sphericity_opened",
+    "frac_kept_opening",
+    "c405_raw_p90",
+    "c405_shell_minus_core_p90",
+    "surface_touching_frac",
+    "n_touching_neighbors",
     "knn_d1",
-    "knn_d3",
     "n_neighbors_30um",
-    "gfp_density",
-    "gfp_feature_value",
+    "axis3d_lambda_ratio_l1_l3",
+    "protrusion_voxel_frac",
 ]
 
 
@@ -140,63 +141,37 @@ class _ROI:
 
 
 def _load_v5d_proba(sid: str) -> pd.DataFrame:
-    """Merge v5d binary + 4-class parquets keyed on hcr_id.
+    """Per-ROI v5d (_um) scores via the consolidated model + features.
 
     Cols: hcr_id, score (binary positive prob), p_bad, p_bad_ok, p_good, p_merged.
     """
-    binary = pd.read_parquet(
-        CACHE / f"{sid}_stage2_binary_score_v5d.parquet"
-    )[["hcr_id", "score"]]
-    proba4 = pd.read_parquet(
-        CACHE / f"{sid}_stage2_4class_proba_v5d.parquet"
-    )[["hcr_id", "p_bad", "p_bad_ok", "p_good", "p_merged"]]
-    return binary.merge(proba4, on="hcr_id")
-
-
-# Mirrors PCT_RANK_COLS in 05h_train_stage2_v5d.py.  Within-subject
-# percentile ranks are computed at sample time so the v5d-trained model's
-# `*_pct_subj` features are populated for the GUI display.
-_V5D_PCT_RANK_COLS = (
-    "volume_vox_opened",
-    "volume_vox_raw",
-    "axis3d_lambda1_vox2",
-    "surface_area_vox_opened",
-)
+    from .. import features as _features, model as _model
+    feats = _features.extract_features(sid)
+    binary_score, proba4 = _model.predict(feats)
+    out = proba4.rename(
+        columns={"bad": "p_bad", "bad_ok": "p_bad_ok",
+                 "good": "p_good", "merged": "p_merged"}
+    ).copy()
+    # binary_score and proba4 are both built from feats in the same row order.
+    out["score"] = binary_score.to_numpy()
+    return out[["hcr_id", "score", "p_bad", "p_bad_ok", "p_good", "p_merged"]]
 
 
 def _load_v5d_features(sid: str) -> pd.DataFrame:
-    """Mirror `05h_train_stage2_v5d._load_features` (without the µm-drop
-    step — we keep all columns for display and let the caller decide).
-    Returns the merged v2 + v3_extra + v4 + v5 + v6_vox feature matrix
-    plus within-subject percentile ranks for `_V5D_PCT_RANK_COLS`."""
-    f = pd.read_parquet(CACHE / f"{sid}_features_v2.parquet")
-    g = pd.read_parquet(CACHE / f"{sid}_features_v3_extra.parquet")
-    h = pd.read_parquet(CACHE / f"{sid}_features_v4.parquet")
-    k = pd.read_parquet(CACHE / f"{sid}_features_v5.parquet")
-    v = pd.read_parquet(CACHE / f"{sid}_features_v6_vox.parquet")
-    out = f.merge(g, on="hcr_id", how="left", suffixes=("", "_v3"))
-    out = out.merge(h, on="hcr_id", how="left", suffixes=("", "_v4"))
-    out = out.merge(k, on="hcr_id", how="left", suffixes=("", "_v5"))
-    out = out.merge(v, on="hcr_id", how="left", suffixes=("", "_v6"))
-    for c in _V5D_PCT_RANK_COLS:
-        if c in out.columns:
-            out[f"{c}_pct_subj"] = out[c].rank(pct=True, method="average")
-        else:
-            out[f"{c}_pct_subj"] = float("nan")
-    return out
+    """Per-ROI _um feature matrix (the consolidated production set).
+
+    Delegates to the single source of truth `roi_classifier.features`
+    (shape + axis + surface + protrusion; µm columns; no v6_vox, no
+    percentile-rank columns)."""
+    from .. import features as _features
+    return _features.extract_features(sid)
 
 
 def _load_all_features(sid: str) -> pd.DataFrame:
-    """Merge the legacy v1 features parquet with the v5d feature stack
-    (v2..v6_vox + pct ranks).  v1 column values win on overlap so the
-    notebook's `KEY_DISPLAY_FEATURES` keys (e.g. `knn_d1`) keep the v1
-    semantics; v5d-only cols are appended."""
-    v1 = pd.read_parquet(CACHE / f"{sid}_features.parquet")
-    v5d = _load_v5d_features(sid)
-    overlap = (set(v1.columns) & set(v5d.columns)) - {"hcr_id"}
-    if overlap:
-        v5d = v5d.drop(columns=list(overlap))
-    return v1.merge(v5d, on="hcr_id", how="left")
+    """All per-ROI features for display + sampling — the consolidated
+    _um feature matrix.  (The legacy v1 base parquet and the v2..v6_vox
+    + pct-rank stack are no longer used.)"""
+    return _load_v5d_features(sid)
 
 
 # Columns we strip from a merged-parquet row when copying values into

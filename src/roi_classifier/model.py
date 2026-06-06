@@ -1,10 +1,13 @@
 """Production API for the v5d ROI-quality stage-2 classifier.
 
-Single entry point for inference (`predict_subject`) and training (`train`).
-Feature extraction merges the five cached parquets per subject (v2, v3_extra,
-v4, v5, v6_vox) and computes within-subject percentile ranks for four size
-columns.  The two LightGBM models (binary + 4-class) are loaded from
-CACHE_DIR on first call to `predict`.
+Public entry points:
+    predict_subject(sid)  — extract features + run both models → per-ROI scores.
+    predict(features_df)  — run both models on a pre-built feature matrix.
+    train(subjects, ...)  — LOSO cross-validation + production model training.
+
+Feature extraction is delegated to ``features.extract_features``.
+Model artifacts are loaded from ``config.MODELS_DIR`` (defaults to the
+``models/`` directory at the repository root via ``MFISH_MODELS_DIR``).
 """
 from __future__ import annotations
 
@@ -27,16 +30,17 @@ from sklearn.metrics import (
 from . import config as _cfg
 
 # ──────────────────────────────────────────────────────────────────────────────
-# constants — mirror 05h_train_stage2_v5d.py exactly
+# constants — mirror the _um variant of 05h_train_stage2_v5d.py exactly
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Feature parquets are read from ROI_QUALITY_DIR; models from MODELS_DIR.
 # Both default to the same location but can be separated via env vars.
 CACHE_DIR = _cfg.ROI_QUALITY_DIR
 
-MODEL_BINARY = _cfg.MODELS_DIR / "roi_quality_stage2_binary_v5d.txt"
-MODEL_FOUR_CLASS = _cfg.MODELS_DIR / "roi_quality_stage2_4class_v5d.txt"
-META_JSON = _cfg.MODELS_DIR / "roi_quality_stage2_meta_v5d.json"
+# Model files shipped inside models/; names carry the _um suffix.
+MODEL_BINARY = _cfg.MODELS_DIR / "roi_quality_stage2_binary_v5d_um.txt"
+MODEL_FOUR_CLASS = _cfg.MODELS_DIR / "roi_quality_stage2_4class_v5d_um.txt"
+META_JSON = _cfg.MODELS_DIR / "roi_quality_stage2_meta_v5d_um.json"
 
 CLASS_NAMES = ["bad", "bad_ok", "good", "merged"]
 CLASS_TO_IDX = {c: i for i, c in enumerate(CLASS_NAMES)}
@@ -44,110 +48,27 @@ CLASS_TO_IDX = {c: i for i, c in enumerate(CLASS_NAMES)}
 BINARY_POS = {"good", "bad_ok"}
 BINARY_NEG = {"bad", "merged"}
 
-PCT_RANK_COLS = [
-    "volume_vox_opened",
-    "volume_vox_raw",
-    "axis3d_lambda1_vox2",
-    "surface_area_vox_opened",
-]
+# 91 µm-variant feature columns — loaded verbatim from the shipped meta JSON so
+# they stay in sync with the trained model without manual transcription.
+# These are µm-based shape/surface/protrusion features + a few raw voxel
+# counts (volume_vox_raw, volume_vox_opened, n_protrusion_voxels,
+# protrusion_rim_voxels) + c405 intensity.  No *_pct_subj rank cols.  No v6_vox
+# intensity features.
+def _load_feature_columns() -> list[str]:
+    meta_path = META_JSON
+    if not meta_path.exists():
+        raise FileNotFoundError(
+            f"model meta JSON not found: {meta_path}\n"
+            f"Point MFISH_MODELS_DIR at the directory containing "
+            f"roi_quality_stage2_meta_v5d_um.json."
+        )
+    with open(meta_path) as _f:
+        _meta = json.load(_f)
+    return list(_meta["feature_columns"])
 
-# 92 columns from roi_quality_stage2_meta_v5d.json, in order.
-FEATURE_COLUMNS: list[str] = [
-    "volume_vox_raw",
-    "aspect_zy",
-    "aspect_zx",
-    "aspect_yx",
-    "solidity_raw",
-    "bbox_occupancy_raw",
-    "volume_vox_opened",
-    "frac_kept_opening",
-    "solidity_opened",
-    "c405_raw_mean",
-    "c405_raw_std",
-    "c405_raw_p10",
-    "c405_raw_p50",
-    "c405_raw_p90",
-    "c405_opened_mean",
-    "c405_opened_std",
-    "c405_opened_p10",
-    "c405_opened_p50",
-    "c405_opened_p90",
-    "c405_core_p50_opened",
-    "c405_shell_p50_opened",
-    "c405_shell_minus_core_p50",
-    "c405_shell_minus_core_p90",
-    "c405_outside_p50",
-    "c405_inside_minus_outside_p50",
-    "c405_inside_minus_outside_p90",
-    "n_touching_neighbors",
-    "surface_touching_frac",
-    "top_neighbor_overlap_frac",
-    "mean_touching_score_stage1",
-    "min_touching_score_stage1",
-    "knn_d1",
-    "axis3d_lambda_ratio_l1_l3",
-    "axis3d_lambda_ratio_l1_l2",
-    "axis3d_peak_prom_max_intens",
-    "axis3d_min_over_max_inner_intens",
-    "axis3d_section_min_over_med_area",
-    "axis3d_section_min_over_max_area",
-    "axis3d_peak_prom_max_area",
-    "axis3d_raw_section_min_over_med_area",
-    "axis3d_raw_peak_prom_max_intens",
-    "proj_xy_main_peak_prom_max",
-    "proj_xy_main_min_over_max_inner",
-    "proj_xy_aspect_ratio",
-    "proj_yz_main_peak_prom_max",
-    "proj_yz_main_min_over_max_inner",
-    "proj_yz_aspect_ratio",
-    "proj_zx_main_peak_prom_max",
-    "proj_zx_main_min_over_max_inner",
-    "proj_zx_aspect_ratio",
-    "sphericity_raw",
-    "sphericity_opened",
-    "n_protrusion_voxels",
-    "protrusion_voxel_frac",
-    "protrusion_rim_voxels",
-    "protrusion_rim_other_frac",
-    "protrusion_rim_bg_frac",
-    "protrusion_top_neighbor_frac",
-    "n_distinct_neighbor_ids_at_protrusion",
-    "protrusion_into_neighbor_frac",
-    "surface_area_vox_raw",
-    "surface_area_vox_opened",
-    "sa_to_vol_vox_inv_raw",
-    "sa_to_vol_vox_inv_opened",
-    "core4vox_voxel_frac_opened",
-    "c405_core4vox_p50_opened",
-    "c405_shell4vox_p50_opened",
-    "c405_shell_minus_core4vox_p50",
-    "c405_shell_minus_core4vox_p90",
-    "c405_shell_over_core4vox_p50_ratio",
-    "axis3d_extent_vox",
-    "axis3d_lambda1_vox2",
-    "axis3d_lambda2_vox2",
-    "axis3d_lambda3_vox2",
-    "axis3d_peak_sep_vox_intens",
-    "axis3d_raw_extent_vox",
-    "proj_xy_main_extent_vox",
-    "proj_yz_main_extent_vox",
-    "proj_zx_main_extent_vox",
-    "proj_xy_orth_fwhm_vox",
-    "proj_yz_orth_fwhm_vox",
-    "proj_zx_orth_fwhm_vox",
-    "bbox_z_extent_vox",
-    "bbox_y_extent_vox",
-    "bbox_x_extent_vox",
-    "equivalent_diameter_vox_raw",
-    "equivalent_diameter_vox_opened",
-    "n_neighbors_30vox",
-    "volume_vox_opened_pct_subj",
-    "volume_vox_raw_pct_subj",
-    "axis3d_lambda1_vox2_pct_subj",
-    "surface_area_vox_opened_pct_subj",
-]
+FEATURE_COLUMNS: list[str] = _load_feature_columns()
 
-assert len(FEATURE_COLUMNS) == 92, f"expected 92 feature columns, got {len(FEATURE_COLUMNS)}"
+assert len(FEATURE_COLUMNS) == 91, f"expected 91 _um feature columns, got {len(FEATURE_COLUMNS)}"
 
 # LightGBM hyper-parameters (identical to 05h trainer)
 LGB_BINARY = dict(
@@ -181,106 +102,6 @@ LGB_MULTI = dict(
 N_ESTIMATORS = 400
 EARLY_STOP = 30
 
-# Columns that are dropped from the model but may appear in raw parquets.
-# Keeping these sets here so callers can reference them if needed.
-_DROP_FROM_MODEL: frozenset[str] = frozenset({
-    "hcr_id", "y", "label", "human_label", "sid",
-    # µm-suffixed columns
-    "axis3d_extent_um", "axis3d_lambda1_um2", "axis3d_lambda2_um2",
-    "axis3d_lambda3_um2", "axis3d_peak_sep_um_intens", "axis3d_raw_extent_um",
-    "bbox_x_extent_um", "bbox_y_extent_um", "bbox_z_extent_um",
-    "c405_core4um_p50_opened", "c405_shell4um_p50_opened",
-    "c405_shell_minus_core4um_p50", "c405_shell_minus_core4um_p90",
-    "c405_shell_over_core4um_p50_ratio", "core4um_voxel_frac_opened",
-    "equivalent_diameter_um_opened", "equivalent_diameter_um_raw",
-    "n_neighbors_30um", "proj_xy_main_extent_um", "proj_xy_orth_fwhm_um",
-    "proj_yz_main_extent_um", "proj_yz_orth_fwhm_um", "proj_zx_main_extent_um",
-    "proj_zx_orth_fwhm_um", "sa_to_vol_um_inv_opened", "sa_to_vol_um_inv_raw",
-    "surface_area_um2_opened", "surface_area_um2_raw",
-    "volume_um3_opened", "volume_um3_raw", "volume_um3_raw_v4",
-    # dead features (zero gain in both binary + 4-class)
-    "boundary_touching", "n_components_after_opening",
-    "tight_bbox_in_pickle_bbox", "volume_pickle_minus_zarr_l2_eq",
-    "protrusion_touches_other",
-    # low-gain v3 peak-counter columns
-    "axis3d_n_peaks_inner_area", "axis3d_peak_prom_2nd_intens",
-    "proj_yz_main_n_peaks_inner", "proj_zx_main_n_peaks_inner",
-    "proj_xy_main_n_peaks_inner", "axis3d_raw_n_peaks_inner_intens",
-    "proj_zx_orth_n_peaks_at_main", "proj_xy_orth_n_peaks_at_main",
-    "proj_yz_orth_n_peaks_at_main", "axis3d_n_peaks_inner_intens",
-})
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# feature extraction
-# ──────────────────────────────────────────────────────────────────────────────
-
-def extract_features(sid: str) -> pd.DataFrame:
-    """Merge the five cached parquets for `sid` and return the v5d feature matrix.
-
-    Reads from CACHE_DIR:
-        {sid}_features_v2.parquet
-        {sid}_features_v3_extra.parquet
-        {sid}_features_v4.parquet
-        {sid}_features_v5.parquet
-        {sid}_features_v6_vox.parquet
-
-    Returns a DataFrame with columns ["hcr_id"] + FEATURE_COLUMNS.
-    Row count equals the number of ROIs for the subject.
-    """
-    paths = {
-        "v2":    CACHE_DIR / f"{sid}_features_v2.parquet",
-        "v3":    CACHE_DIR / f"{sid}_features_v3_extra.parquet",
-        "v4":    CACHE_DIR / f"{sid}_features_v4.parquet",
-        "v5":    CACHE_DIR / f"{sid}_features_v5.parquet",
-        "v6":    CACHE_DIR / f"{sid}_features_v6_vox.parquet",
-    }
-    for name, p in paths.items():
-        if not p.exists():
-            raise FileNotFoundError(f"[{sid}] {name} parquet missing: {p}")
-
-    f   = pd.read_parquet(paths["v2"])
-    g   = pd.read_parquet(paths["v3"])
-    h   = pd.read_parquet(paths["v4"])
-    k   = pd.read_parquet(paths["v5"])
-    v   = pd.read_parquet(paths["v6"])
-
-    n_ref = len(f)
-    for name, df in [("v3", g), ("v4", h), ("v5", k), ("v6", v)]:
-        if len(df) != n_ref:
-            print(f"  [{sid}] WARNING: {name} has {len(df)} rows vs v2 {n_ref} rows — "
-                  f"merge will be on hcr_id (left join)")
-
-    out = f.merge(g, on="hcr_id", how="left", suffixes=("", "_v3"))
-    out = out.merge(h, on="hcr_id", how="left", suffixes=("", "_v4"))
-    out = out.merge(k, on="hcr_id", how="left", suffixes=("", "_v5d"))
-    out = out.merge(v, on="hcr_id", how="left", suffixes=("", "_v6"))
-
-    # within-subject percentile ranks (computed on ALL rows, not just labelled)
-    for c in PCT_RANK_COLS:
-        if c in out.columns:
-            out[f"{c}_pct_subj"] = out[c].rank(pct=True, method="average")
-        else:
-            out[f"{c}_pct_subj"] = float("nan")
-
-    # validate
-    missing = [c for c in FEATURE_COLUMNS if c not in out.columns]
-    if missing:
-        raise ValueError(f"[{sid}] missing feature columns after merge: {missing}")
-
-    out = out[["hcr_id"] + FEATURE_COLUMNS].copy()
-
-    nan_counts = out[FEATURE_COLUMNS].isna().sum()
-    cols_with_nan = nan_counts[nan_counts > 0]
-    if len(cols_with_nan) > 0:
-        print(f"  [{sid}] NaN counts in feature columns (expected for some intensity cols "
-              f"on empty masks):")
-        for col, cnt in cols_with_nan.items():
-            print(f"    {col}: {cnt}")
-
-    print(f"  [{sid}] extract_features: {len(out)} ROIs, {len(FEATURE_COLUMNS)} features")
-    return out
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # inference
@@ -302,8 +123,8 @@ def predict(
     binary_score : pd.Series indexed by hcr_id, float in [0, 1] (positive = good/bad_ok).
     four_class_proba : pd.DataFrame[hcr_id, bad, bad_ok, good, merged].
     """
-    bin_path  = model_dir / "roi_quality_stage2_binary_v5d.txt"
-    multi_path = model_dir / "roi_quality_stage2_4class_v5d.txt"
+    bin_path   = model_dir / "roi_quality_stage2_binary_v5d_um.txt"
+    multi_path = model_dir / "roi_quality_stage2_4class_v5d_um.txt"
     for p in (bin_path, multi_path):
         if not p.exists():
             raise FileNotFoundError(f"model file missing: {p}")
@@ -335,6 +156,7 @@ def predict_subject(sid: str) -> pd.DataFrame:
     Columns: hcr_id, binary_score, proba_bad, proba_bad_ok, proba_good,
              proba_merged, predicted_class.
     """
+    from .features import extract_features
     feat = extract_features(sid)
     binary_score, four_class_proba = predict(feat)
 
@@ -429,14 +251,16 @@ def train(
     Mirrors 05h_train_stage2_v5d.main() but uses this module's API.
 
     Writes to out_dir:
-        roi_quality_stage2_binary_v5d.txt
-        roi_quality_stage2_4class_v5d.txt
-        roi_quality_stage2_meta_v5d.json
-        {sid}_stage2_binary_score_v5d.parquet  (per-subject OOF)
-        {sid}_stage2_4class_proba_v5d.parquet  (per-subject OOF)
+        roi_quality_stage2_binary_v5d_um.txt
+        roi_quality_stage2_4class_v5d_um.txt
+        roi_quality_stage2_meta_v5d_um.json
+        {sid}_stage2_binary_score_v5d_um.parquet  (per-subject OOF)
+        {sid}_stage2_4class_proba_v5d_um.parquet  (per-subject OOF)
 
     Returns the meta dict.
     """
+    from .features import extract_features
+
     out_dir.mkdir(parents=True, exist_ok=True)
     log = _load_label_log(label_log_path)
     print(f"label log: {len(log)} rows")
@@ -512,7 +336,7 @@ def train(
             l_held.rename(columns={"label": "human_label"})[["hcr_id", "human_label"]],
             on="hcr_id", how="left",
         )
-        oof.to_parquet(out_dir / f"{held}_stage2_binary_score_v5d.parquet", index=False)
+        oof.to_parquet(out_dir / f"{held}_stage2_binary_score_v5d_um.parquet", index=False)
 
     bm = pd.DataFrame(bin_metrics).sort_values("held_subject")
     print(f"\nbinary v5d LOSO:  mean AUC={bm['auc'].mean():.4f}  "
@@ -583,7 +407,7 @@ def train(
             l_held.rename(columns={"label": "human_label"})[["hcr_id", "human_label"]],
             on="hcr_id", how="left",
         )
-        oof.to_parquet(out_dir / f"{held}_stage2_4class_proba_v5d.parquet", index=False)
+        oof.to_parquet(out_dir / f"{held}_stage2_4class_proba_v5d_um.parquet", index=False)
 
     mm = pd.DataFrame(multi_metrics).sort_values("held_subject")
     print(f"\n4-class v5d LOSO:  mean acc={mm['acc'].mean():.4f}  "
@@ -605,7 +429,7 @@ def train(
     bin_prod = lgb.train(LGB_BINARY, lgb.Dataset(Xb, yb),
                          num_boost_round=n_iter_b,
                          callbacks=[lgb.log_evaluation(0)])
-    bin_prod.save_model(str(out_dir / "roi_quality_stage2_binary_v5d.txt"))
+    bin_prod.save_model(str(out_dir / "roi_quality_stage2_binary_v5d_um.txt"))
     print(f"  binary: {len(Xb)} rows, {n_iter_b} iters")
 
     Xm_parts, ym_parts = [], []
@@ -621,7 +445,7 @@ def train(
     multi_prod = lgb.train(LGB_MULTI, lgb.Dataset(Xm, ym),
                            num_boost_round=n_iter_m,
                            callbacks=[lgb.log_evaluation(0)])
-    multi_prod.save_model(str(out_dir / "roi_quality_stage2_4class_v5d.txt"))
+    multi_prod.save_model(str(out_dir / "roi_quality_stage2_4class_v5d_um.txt"))
     print(f"  4-class: {len(Xm)} rows, {n_iter_m} iters")
 
     meta: dict = {
@@ -649,6 +473,6 @@ def train(
             "params": LGB_MULTI,
         },
     }
-    (out_dir / "roi_quality_stage2_meta_v5d.json").write_text(json.dumps(meta, indent=2))
-    print(f"  meta -> {out_dir / 'roi_quality_stage2_meta_v5d.json'}")
+    (out_dir / "roi_quality_stage2_meta_v5d_um.json").write_text(json.dumps(meta, indent=2))
+    print(f"  meta -> {out_dir / 'roi_quality_stage2_meta_v5d_um.json'}")
     return meta

@@ -28,7 +28,7 @@ from tqdm import tqdm
 warnings.filterwarnings("ignore", category=UserWarning, module="zarr")
 
 from .benchmark_data_loader import SubjectData
-from .roi_quality_v2 import (
+from .feat_shape import (
     OPENING_RADIUS, STRIP_Z, Z_PAD, _CROSS_3D,
     _ch405_l2, _orig_res_path,
 )
@@ -255,3 +255,9 @@ def extract_v3_extras(
     with open(_meta_v3_extra_path(sid), "w") as f:
         json.dump(meta, f, indent=2)
     return feat_df
+
+
+# Public entry point used by features.extract_features.
+def compute(s: SubjectData, cache: bool = True) -> pd.DataFrame:
+    """Compute (or load from cache) axis-profile + 2D-projection features for subject s."""
+    return extract_v3_extras(s, cache=cache)

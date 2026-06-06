@@ -32,7 +32,7 @@ import zarr
 warnings.filterwarnings("ignore", category=UserWarning, module="zarr")
 
 from .benchmark_data_loader import load_subject
-from .roi_quality_v2 import STRIP_Z, Z_PAD, _CROSS_3D, _orig_res_path
+from .feat_shape import STRIP_Z, Z_PAD, _CROSS_3D, _orig_res_path
 from . import config as _cfg
 
 PER_CELL_CROPS = _cfg.PER_CELL_CROPS_DIR

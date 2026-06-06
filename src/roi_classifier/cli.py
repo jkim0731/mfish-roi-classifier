@@ -29,7 +29,8 @@ from pathlib import Path
 
 def _cmd_predict(args: argparse.Namespace) -> int:
     from . import config as _cfg
-    from .roi_quality_v5d import extract_features, predict
+    from .features import extract_features
+    from .model import predict, _load_label_log, _active_labels
 
     sid = str(args.sid)
     print(f"[predict] subject={sid}")
@@ -55,7 +56,6 @@ def _cmd_predict(args: argparse.Namespace) -> int:
     label_log = _cfg.ROI_QUALITY_DIR / "roi_qc_actions.jsonl"
     if label_log.exists():
         try:
-            from .roi_quality_v5d import _load_label_log, _active_labels
             log = _load_label_log(label_log)
             labs = _active_labels(log, sid)
             if not labs.empty:
@@ -86,7 +86,7 @@ def _cmd_predict(args: argparse.Namespace) -> int:
 
 def _cmd_train(args: argparse.Namespace) -> int:
     from . import config as _cfg
-    from .roi_quality_v5d import train
+    from .model import train
     from .benchmark_data_loader import BENCHMARK_SUBJECTS
 
     label_log = Path(args.label_log) if args.label_log else (

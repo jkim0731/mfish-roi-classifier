@@ -4,7 +4,7 @@ S11 / Step 4b — STANDALONE HCR ROI labelling GUI (no Jupyter).
 A pure matplotlib-window application.  Run from a shell with a
 display::
 
-    python code/sessions/v3_S11_roi_quality/04b_label_gui_app.py \
+    python -m roi_classifier.label_gui.app \
         --sid 788406 --reviewer alice
 
 Why this exists alongside `04_label_gui.ipynb`: the notebook flavour
@@ -103,7 +103,7 @@ _PROBA_ORDER = ("bad", "bad_ok", "good", "merged")
 # the user reruns `05h_train_stage2_v5d.py`) the panel is rebuilt with
 # the new top-N list.
 from .. import config as _cfg  # noqa: E402
-_V5D_4CLASS_MODEL = _cfg.MODELS_DIR / "roi_quality_stage2_4class_v5d.txt"
+_V5D_4CLASS_MODEL = _cfg.MODELS_DIR / "roi_quality_stage2_4class_v5d_um.txt"
 _TOP_FEATURE_N = 10
 
 

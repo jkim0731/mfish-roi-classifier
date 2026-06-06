@@ -1,11 +1,14 @@
-"""Per-ROI v7 features (image-quality), extraction.
+"""Per-ROI v5 features (protrusion-touches-other-ROI), extraction.
 
-Mirrors v4's strip + multiprocessing layout: reads cached padded mask crops,
-loads c405 zarr per z-strip, slices tight per-cell windows, calls
-`roi_v7_features.image_quality_features` on (mask_opened_tight, img_405_tight).
+Reads:
+- per-cell padded mask crops from `cached_per_cell_crops/{sid}_per_cell_crops.parquet`
+- seg_orig (level-2 labelled zarr) per z-strip, sliced per cell
 
-Output: `cached_roi_quality/{sid}_features_v7.parquet`
-        cols = `hcr_id` + `roi_v7_features.feature_columns()`
+Recomputes binary opening per-cell on the padded crop (cheap), then calls
+`roi_v5_features.protrusion_features(mask_raw_pad, mask_opened_pad, seg_pad, hcr_id)`.
+
+Output: `cached_roi_quality/{sid}_features_v5.parquet`
+        cols = `hcr_id` + `roi_v5_features.feature_columns()`
 """
 from __future__ import annotations
 
@@ -25,23 +28,22 @@ import zarr
 warnings.filterwarnings("ignore", category=UserWarning, module="zarr")
 
 from .benchmark_data_loader import load_subject
-from .roi_quality_v2 import (
-    OPENING_RADIUS, STRIP_Z, Z_PAD, _CROSS_3D, _ch405_l2, _orig_res_path,
+from .feat_shape import (
+    OPENING_RADIUS, STRIP_Z, Z_PAD, _CROSS_3D, _orig_res_path,
 )
-from .roi_v7_features import feature_columns, image_quality_features
+from .roi_v5_features import feature_columns, protrusion_features
 from . import config as _cfg
 
 PER_CELL_CROPS = _cfg.PER_CELL_CROPS_DIR
 ROI_QUALITY_CACHE = _cfg.ROI_QUALITY_DIR
-TIGHT_BBOX_CACHE = _cfg.TIGHT_BBOX_DIR
 
 
-def _features_v7_cache_path(sid: str) -> Path:
-    return ROI_QUALITY_CACHE / f"{sid}_features_v7.parquet"
+def _features_v5_cache_path(sid: str) -> Path:
+    return ROI_QUALITY_CACHE / f"{sid}_features_v5.parquet"
 
 
-def _meta_v7_path(sid: str) -> Path:
-    return ROI_QUALITY_CACHE / f"{sid}_meta_v7.json"
+def _meta_v5_path(sid: str) -> Path:
+    return ROI_QUALITY_CACHE / f"{sid}_meta_v5.json"
 
 
 def _decode_mask(row: pd.Series) -> np.ndarray:
@@ -50,8 +52,8 @@ def _decode_mask(row: pd.Series) -> np.ndarray:
     return bits.astype(bool).reshape(int(row["dz"]), int(row["dy"]), int(row["dx"]))
 
 
-def _extract_v7_subject(sid: str, force: bool = False) -> Dict:
-    out_path = _features_v7_cache_path(sid)
+def _extract_v5_subject(sid: str, force: bool = False) -> Dict:
+    out_path = _features_v5_cache_path(sid)
     if out_path.exists() and not force:
         return {"sid": sid, "skipped": "cache_hit", "path": str(out_path)}
 
@@ -59,30 +61,13 @@ def _extract_v7_subject(sid: str, force: bool = False) -> Dict:
     if not crops_path.exists():
         return {"sid": sid, "error": f"missing crops: {crops_path}"}
 
-    tb_path = TIGHT_BBOX_CACHE / f"{sid}_hcr_cell_tight_bbox_v1.parquet"
-    if not tb_path.exists():
-        return {"sid": sid, "error": f"missing tight bbox cache: {tb_path}"}
-
     s = load_subject(sid)
     seg_orig = zarr.open(str(_orig_res_path(s)), mode="r")
     _, _, Z_seg, Y_seg, X_seg = seg_orig.shape
-    vz = float(s.hcr_z_um)
-    vxy = float(s.hcr_xy_um)
-
-    arr405 = _ch405_l2(s)
-    has_405 = arr405 is not None
 
     crops_df = pd.read_parquet(crops_path)
-    tb_df = pd.read_parquet(tb_path)
-    tb_lookup = {
-        int(r.hcr_id): (
-            int(r.zmin_vox), int(r.zmax_vox),
-            int(r.ymin_vox), int(r.ymax_vox),
-            int(r.xmin_vox), int(r.xmax_vox),
-        )
-        for r in tb_df.itertuples(index=False)
-    }
 
+    # Bucket cells into strips by centroid z (matches v2 strip layout).
     cent = s.hcr_centroids.set_index("hcr_id")
     if not s.hcr_centroids.empty:
         z_lo_global = max(0, int(s.hcr_centroids["z_px"].min()) - 2)
@@ -92,7 +77,6 @@ def _extract_v7_subject(sid: str, force: bool = False) -> Dict:
     for hid in crops_df["hcr_id"].astype(int).tolist():
         if hid in cent.index:
             cent_z[hid] = int(round(float(cent.loc[hid]["z_px"])))
-
     crops_df["_strip"] = crops_df["hcr_id"].map(
         lambda h: z_lo_global + ((cent_z.get(int(h), 0) - z_lo_global) // STRIP_Z) * STRIP_Z
     )
@@ -119,64 +103,42 @@ def _extract_v7_subject(sid: str, force: bool = False) -> Dict:
         sub_x0 = max(0, x_min)
         sub_x1 = min(X_seg, x_max)
 
-        if has_405:
-            ch405_block = np.asarray(
-                arr405[0, 0, z0_load:z1_load, sub_y0:sub_y1, sub_x0:sub_x1]
-            ).astype(np.uint16)
-        else:
-            ch405_block = None
+        seg_block = np.asarray(
+            seg_orig[0, 0, z0_load:z1_load, sub_y0:sub_y1, sub_x0:sub_x1]
+        )
 
         for _, row in sub.iterrows():
             hid = int(row["hcr_id"])
             mask_pad = _decode_mask(row)
             if not mask_pad.any():
-                n_missing += 1
-                continue
-
-            tb = tb_lookup.get(hid)
-            if tb is None:
-                n_missing += 1
-                continue
-            zmin, zmax_ex, ymin, ymax_ex, xmin, xmax_ex = tb
-            tz0 = zmin - int(row["z0_lvl2"])
-            ty0 = ymin - int(row["y0_lvl2"])
-            tx0 = xmin - int(row["x0_lvl2"])
-            tz1 = tz0 + (zmax_ex - zmin)
-            ty1 = ty0 + (ymax_ex - ymin)
-            tx1 = tx0 + (xmax_ex - xmin)
-            if (tz0 < 0 or ty0 < 0 or tx0 < 0
-                    or tz1 > mask_pad.shape[0]
-                    or ty1 > mask_pad.shape[1]
-                    or tx1 > mask_pad.shape[2]):
+                feats = {c: float("nan") for c in feature_columns()}
+                feats["hcr_id"] = hid
+                feature_rows.append(feats)
                 n_missing += 1
                 continue
 
             mask_opened_pad = ndi.binary_opening(
                 mask_pad, structure=_CROSS_3D, iterations=OPENING_RADIUS,
             )
-            mask_opened_tight = mask_opened_pad[tz0:tz1, ty0:ty1, tx0:tx1]
 
-            if has_405:
-                bz0 = int(row["z0_lvl2"]) - z0_load
-                bz1 = bz0 + int(row["dz"])
-                by0 = int(row["y0_lvl2"]) - sub_y0
-                by1 = by0 + int(row["dy"])
-                bx0 = int(row["x0_lvl2"]) - sub_x0
-                bx1 = bx0 + int(row["dx"])
-                if (bz0 < 0 or by0 < 0 or bx0 < 0
-                        or bz1 > ch405_block.shape[0]
-                        or by1 > ch405_block.shape[1]
-                        or bx1 > ch405_block.shape[2]):
-                    img_tight = None
-                else:
-                    img_pad = ch405_block[bz0:bz1, by0:by1, bx0:bx1]
-                    img_tight = img_pad[tz0:tz1, ty0:ty1, tx0:tx1]
-            else:
-                img_tight = None
+            bz0 = int(row["z0_lvl2"]) - z0_load
+            bz1 = bz0 + int(row["dz"])
+            by0 = int(row["y0_lvl2"]) - sub_y0
+            by1 = by0 + int(row["dy"])
+            bx0 = int(row["x0_lvl2"]) - sub_x0
+            bx1 = bx0 + int(row["dx"])
+            if (bz0 < 0 or by0 < 0 or bx0 < 0
+                    or bz1 > seg_block.shape[0]
+                    or by1 > seg_block.shape[1]
+                    or bx1 > seg_block.shape[2]):
+                feats = {c: float("nan") for c in feature_columns()}
+                feats["hcr_id"] = hid
+                feature_rows.append(feats)
+                n_missing += 1
+                continue
 
-            feats = image_quality_features(
-                mask_opened_tight, img_tight, vz=vz, vy=vxy, vx=vxy,
-            )
+            seg_pad = seg_block[bz0:bz1, by0:by1, bx0:bx1]
+            feats = protrusion_features(mask_pad, mask_opened_pad, seg_pad, hid)
             feats["hcr_id"] = hid
             feature_rows.append(feats)
             n_done += 1
@@ -190,8 +152,8 @@ def _extract_v7_subject(sid: str, force: bool = False) -> Dict:
             )
 
     cols = feature_columns()
-    nan_template = {c: float("nan") for c in cols}
     seen = {int(r["hcr_id"]) for r in feature_rows}
+    nan_template = {c: float("nan") for c in cols}
     for hid in s.hcr_centroids["hcr_id"].astype(int).tolist():
         if int(hid) in seen:
             continue
@@ -206,20 +168,17 @@ def _extract_v7_subject(sid: str, force: bool = False) -> Dict:
     elapsed = time.time() - t0
     meta = {
         "subject_id": sid,
-        "version": "v7",
-        "channels_used": ["405"] if has_405 else [],
+        "version": "v5",
         "total_rois": int(len(feat_df)),
         "n_extracted": int(n_done),
         "n_missing": int(n_missing),
         "extraction_timestamp": datetime.utcnow().isoformat() + "Z",
-        "seg_xy_um": vxy,
-        "seg_z_um": vz,
         "opening_radius_voxels": OPENING_RADIUS,
         "strip_z": STRIP_Z,
         "z_pad": Z_PAD,
         "elapsed_seconds": float(elapsed),
     }
-    with open(_meta_v7_path(sid), "w") as f:
+    with open(_meta_v5_path(sid), "w") as f:
         json.dump(meta, f, indent=2)
 
     sz = out_path.stat().st_size
@@ -236,10 +195,23 @@ def _extract_v7_subject(sid: str, force: bool = False) -> Dict:
     }
 
 
-def extract_v7_all(subjects: List[str], workers: int = 6, force: bool = False
-                   ) -> List[Dict]:
+def extract_v5_all(subjects: List[str], workers: int = 6, force: bool = False) -> List[Dict]:
     ctx = get_context("spawn")
     args = [(sid, force) for sid in subjects]
     with ctx.Pool(processes=min(workers, len(subjects))) as pool:
-        results = pool.starmap(_extract_v7_subject, args)
+        results = pool.starmap(_extract_v5_subject, args)
     return results
+
+
+# Public entry point used by features.extract_features.
+def compute(s, cache: bool = True) -> "pd.DataFrame":
+    """Compute (or load from cache) protrusion features for subject s."""
+    import pandas as _pd
+    sid = s.subject_id if hasattr(s, "subject_id") else str(s)
+    out_path = _features_v5_cache_path(sid)
+    if cache and out_path.exists():
+        return _pd.read_parquet(out_path)
+    result = _extract_v5_subject(sid, force=True)
+    if "error" in result:
+        raise RuntimeError(f"[{sid}] feat_protrusion extract failed: {result['error']}")
+    return _pd.read_parquet(out_path)

@@ -1,12 +1,16 @@
-"""Per-ROI v6 voxel-companion features for the v5d expansion-rate test.
+"""Per-ROI v4-NEW features (surface area + sphericity + calibrated core/shell).
 
-For every µm-derived v4/v3 feature that has no voxel/unitless companion, recompute
-the same feature with identity calibration `(vz, vy, vx) = (1, 1, 1)` and
-`r_core_um = 4` (= 4 voxels) / `bin_um = 1` (= 1 voxel). The outputs are renamed
-from `*_um*` to `*_vox*`.
+Design:
+- Reads per-cell padded mask crops from `cached_per_cell_crops/{sid}_per_cell_crops.parquet`
+  (no zarr re-read for seg).
+- Reads c405 zarr ONCE per z-strip (using v2 STRIP_Z=128, Z_PAD=24) and slices
+  per-cell windows from the strip block — same logic as v2/v3 but with a
+  cheap raw uint16 zarr instead of the labelled seg zarr.
+- Recomputes binary opening per-cell on the padded crop (cheap on small crops).
+- Calls `roi_v4_features.all_v4_features` on the tight crops.
 
-Output: `cached_roi_quality/{sid}_features_v6_vox.parquet` with columns
-        `hcr_id` + the voxel-companion feature names.
+Output: `cached_roi_quality/{sid}_features_v4.parquet` with columns
+        `hcr_id` + `roi_v4_features.feature_columns()`.
 """
 from __future__ import annotations
 
@@ -20,81 +24,30 @@ from typing import Dict, List
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import scipy.ndimage as ndi
 import zarr
-from scipy.spatial import cKDTree
 
 warnings.filterwarnings("ignore", category=UserWarning, module="zarr")
 
 from .benchmark_data_loader import load_subject
-from .roi_quality_v2 import (
+from .feat_shape import (
     OPENING_RADIUS, STRIP_Z, Z_PAD, _CROSS_3D, _ch405_l2, _orig_res_path,
 )
-from .roi_v4_features import all_v4_features
-from .roi_v3_axis_features import all_v3_axis_features
+from .roi_v4_features import all_v4_features, feature_columns, R_CORE_UM_DEFAULT
 from . import config as _cfg
 
 PER_CELL_CROPS = _cfg.PER_CELL_CROPS_DIR
 ROI_QUALITY_CACHE = _cfg.ROI_QUALITY_DIR
 TIGHT_BBOX_CACHE = _cfg.TIGHT_BBOX_DIR
 
-R_CORE_VOX = 4.0
-BIN_VOX = 1.0
-NEIGHBOR_RADIUS_VOX = 30.0
 
-# v4 features that are µm-typed and need a vox-renamed companion. Volume_vox*
-# and sphericity_*/sav are already in the merged frame (sphericity is unitless,
-# volume_vox already exists), so we only emit the truly missing ones.
-_V4_RENAME = {
-    "surface_area_um2_raw":             "surface_area_vox_raw",
-    "surface_area_um2_opened":          "surface_area_vox_opened",
-    "sa_to_vol_um_inv_raw":             "sa_to_vol_vox_inv_raw",
-    "sa_to_vol_um_inv_opened":          "sa_to_vol_vox_inv_opened",
-    "core4um_voxel_frac_opened":        "core4vox_voxel_frac_opened",
-    "c405_core4um_p50_opened":          "c405_core4vox_p50_opened",
-    "c405_shell4um_p50_opened":         "c405_shell4vox_p50_opened",
-    "c405_shell_minus_core4um_p50":     "c405_shell_minus_core4vox_p50",
-    "c405_shell_minus_core4um_p90":     "c405_shell_minus_core4vox_p90",
-    "c405_shell_over_core4um_p50_ratio": "c405_shell_over_core4vox_p50_ratio",
-}
-
-# v3 axis/projection features that are µm-typed.
-_V3_RENAME = {
-    "axis3d_extent_um":              "axis3d_extent_vox",
-    "axis3d_lambda1_um2":            "axis3d_lambda1_vox2",
-    "axis3d_lambda2_um2":            "axis3d_lambda2_vox2",
-    "axis3d_lambda3_um2":            "axis3d_lambda3_vox2",
-    "axis3d_peak_sep_um_intens":     "axis3d_peak_sep_vox_intens",
-    "axis3d_raw_extent_um":          "axis3d_raw_extent_vox",
-    "proj_xy_main_extent_um":        "proj_xy_main_extent_vox",
-    "proj_yz_main_extent_um":        "proj_yz_main_extent_vox",
-    "proj_zx_main_extent_um":        "proj_zx_main_extent_vox",
-    "proj_xy_orth_fwhm_um":          "proj_xy_orth_fwhm_vox",
-    "proj_yz_orth_fwhm_um":          "proj_yz_orth_fwhm_vox",
-    "proj_zx_orth_fwhm_um":          "proj_zx_orth_fwhm_vox",
-}
-
-# bbox extents + equivalent diameters in voxel units (computed directly).
-_EXTRA_COLS = [
-    "bbox_z_extent_vox",
-    "bbox_y_extent_vox",
-    "bbox_x_extent_vox",
-    "equivalent_diameter_vox_raw",
-    "equivalent_diameter_vox_opened",
-    "n_neighbors_30vox",
-]
+def _features_v4_cache_path(sid: str) -> Path:
+    return ROI_QUALITY_CACHE / f"{sid}_features_v4.parquet"
 
 
-def feature_columns() -> list[str]:
-    return list(_V4_RENAME.values()) + list(_V3_RENAME.values()) + _EXTRA_COLS
-
-
-def _features_v6_path(sid: str) -> Path:
-    return ROI_QUALITY_CACHE / f"{sid}_features_v6_vox.parquet"
-
-
-def _meta_v6_path(sid: str) -> Path:
-    return ROI_QUALITY_CACHE / f"{sid}_meta_v6_vox.json"
+def _meta_v4_path(sid: str) -> Path:
+    return ROI_QUALITY_CACHE / f"{sid}_meta_v4.json"
 
 
 def _decode_mask(row: pd.Series) -> np.ndarray:
@@ -103,20 +56,17 @@ def _decode_mask(row: pd.Series) -> np.ndarray:
     return bits.astype(bool).reshape(int(row["dz"]), int(row["dy"]), int(row["dx"]))
 
 
-def _equivalent_diameter_vox(volume_vox: float) -> float:
-    if not np.isfinite(volume_vox) or volume_vox <= 0:
-        return float("nan")
-    return 2.0 * (3.0 * volume_vox / (4.0 * np.pi)) ** (1.0 / 3.0)
-
-
-def _extract_v6_subject(sid: str, force: bool = False) -> Dict:
-    out_path = _features_v6_path(sid)
+def _extract_v4_subject(
+    sid: str, r_core_um: float = R_CORE_UM_DEFAULT, force: bool = False,
+) -> Dict:
+    out_path = _features_v4_cache_path(sid)
     if out_path.exists() and not force:
         return {"sid": sid, "skipped": "cache_hit", "path": str(out_path)}
 
     crops_path = PER_CELL_CROPS / f"{sid}_per_cell_crops.parquet"
     if not crops_path.exists():
         return {"sid": sid, "error": f"missing crops: {crops_path}"}
+
     tb_path = TIGHT_BBOX_CACHE / f"{sid}_hcr_cell_tight_bbox_v1.parquet"
     if not tb_path.exists():
         return {"sid": sid, "error": f"missing tight bbox cache: {tb_path}"}
@@ -124,6 +74,8 @@ def _extract_v6_subject(sid: str, force: bool = False) -> Dict:
     s = load_subject(sid)
     seg_orig = zarr.open(str(_orig_res_path(s)), mode="r")
     _, _, Z_seg, Y_seg, X_seg = seg_orig.shape
+    vz = float(s.hcr_z_um)
+    vxy = float(s.hcr_xy_um)
 
     arr405 = _ch405_l2(s)
     has_405 = arr405 is not None
@@ -139,15 +91,17 @@ def _extract_v6_subject(sid: str, force: bool = False) -> Dict:
         for r in tb_df.itertuples(index=False)
     }
 
+    # Bucket cache rows by their strip bucket using crop origin z0_lvl2.
     cent = s.hcr_centroids.set_index("hcr_id")
     if not s.hcr_centroids.empty:
         z_lo_global = max(0, int(s.hcr_centroids["z_px"].min()) - 2)
     else:
         z_lo_global = 0
-    cent_z: Dict[int, int] = {}
+    cent_z = {}
     for hid in crops_df["hcr_id"].astype(int).tolist():
         if hid in cent.index:
             cent_z[hid] = int(round(float(cent.loc[hid]["z_px"])))
+
     crops_df["_strip"] = crops_df["hcr_id"].map(
         lambda h: z_lo_global + ((cent_z.get(int(h), 0) - z_lo_global) // STRIP_Z) * STRIP_Z
     )
@@ -177,7 +131,7 @@ def _extract_v6_subject(sid: str, force: bool = False) -> Dict:
         if has_405:
             ch405_block = np.asarray(
                 arr405[0, 0, z0_load:z1_load, sub_y0:sub_y1, sub_x0:sub_x1]
-            ).astype(np.float32)
+            ).astype(np.uint16)
         else:
             ch405_block = None
 
@@ -212,7 +166,7 @@ def _extract_v6_subject(sid: str, force: bool = False) -> Dict:
             )
             mask_opened_tight = mask_opened_pad[tz0:tz1, ty0:ty1, tx0:tx1]
 
-            if has_405 and ch405_block is not None:
+            if has_405:
                 bz0 = int(row["z0_lvl2"]) - z0_load
                 bz1 = bz0 + int(row["dz"])
                 by0 = int(row["y0_lvl2"]) - sub_y0
@@ -225,34 +179,17 @@ def _extract_v6_subject(sid: str, force: bool = False) -> Dict:
                         or bx1 > ch405_block.shape[2]):
                     img_tight = None
                 else:
-                    img_tight = ch405_block[bz0:bz1, by0:by1, bx0:bx1][
-                        tz0:tz1, ty0:ty1, tx0:tx1
-                    ]
+                    img_pad = ch405_block[bz0:bz1, by0:by1, bx0:bx1]
+                    img_tight = img_pad[tz0:tz1, ty0:ty1, tx0:tx1]
             else:
                 img_tight = None
 
-            v4_feats = all_v4_features(
+            feats = all_v4_features(
                 mask_raw_tight, mask_opened_tight, img_tight,
-                vz=1.0, vy=1.0, vx=1.0, r_core_um=R_CORE_VOX,
+                vz, vxy, vxy, r_core_um=r_core_um,
             )
-            v3_feats = all_v3_axis_features(
-                mask_opened_tight, mask_raw_tight, img_tight,
-                vz=1.0, vy=1.0, vx=1.0, bin_um=BIN_VOX,
-            )
-
-            row_out: Dict[str, float] = {"hcr_id": hid}
-            for src, dst in _V4_RENAME.items():
-                row_out[dst] = float(v4_feats.get(src, float("nan")))
-            for src, dst in _V3_RENAME.items():
-                row_out[dst] = float(v3_feats.get(src, float("nan")))
-            row_out["bbox_z_extent_vox"] = float(zmax_ex - zmin)
-            row_out["bbox_y_extent_vox"] = float(ymax_ex - ymin)
-            row_out["bbox_x_extent_vox"] = float(xmax_ex - xmin)
-            vol_raw = float(mask_raw_tight.sum())
-            vol_op = float(mask_opened_tight.sum())
-            row_out["equivalent_diameter_vox_raw"] = _equivalent_diameter_vox(vol_raw)
-            row_out["equivalent_diameter_vox_opened"] = _equivalent_diameter_vox(vol_op)
-            feature_rows.append(row_out)
+            feats["hcr_id"] = hid
+            feature_rows.append(feats)
             n_done += 1
 
         if (s_idx + 1) % max(1, len(strip_keys) // 5) == 0:
@@ -263,35 +200,16 @@ def _extract_v6_subject(sid: str, force: bool = False) -> Dict:
                 flush=True,
             )
 
-    # n_neighbors_30vox: count cells with centroid within 30 voxels in
-    # anisotropic voxel coords (z, y, x). NOTE: this uses voxel-units of the
-    # level-2 grid directly — no µm calibration. Matches v2's n_neighbors_30um
-    # in shape but in voxel space.
-    neigh_map: Dict[int, int] = {}
-    if not s.hcr_centroids.empty:
-        cent_arr = s.hcr_centroids[["z_px", "y_px", "x_px"]].to_numpy(float)
-        ids = s.hcr_centroids["hcr_id"].astype(int).to_numpy()
-        tree = cKDTree(cent_arr)
-        for hid, p in zip(ids, cent_arr):
-            if not np.isfinite(p).all():
-                neigh_map[int(hid)] = 0
-                continue
-            counts = tree.query_ball_point(p, r=NEIGHBOR_RADIUS_VOX, return_length=True)
-            neigh_map[int(hid)] = int(max(0, counts - 1))
-
-    seen_ids = {int(r["hcr_id"]) for r in feature_rows}
-    nan_template = {c: float("nan") for c in feature_columns()}
+    cols = feature_columns()
+    nan_template = {c: float("nan") for c in cols}
+    seen = {int(r["hcr_id"]) for r in feature_rows}
     for hid in s.hcr_centroids["hcr_id"].astype(int).tolist():
-        if int(hid) in seen_ids:
+        if int(hid) in seen:
             continue
         miss = dict(nan_template)
         miss["hcr_id"] = int(hid)
         feature_rows.append(miss)
 
-    for r in feature_rows:
-        r["n_neighbors_30vox"] = neigh_map.get(int(r["hcr_id"]), 0)
-
-    cols = feature_columns()
     feat_df = pd.DataFrame(feature_rows).sort_values("hcr_id").reset_index(drop=True)
     feat_df = feat_df[["hcr_id"] + cols]
     feat_df.to_parquet(out_path, index=False)
@@ -299,20 +217,21 @@ def _extract_v6_subject(sid: str, force: bool = False) -> Dict:
     elapsed = time.time() - t0
     meta = {
         "subject_id": sid,
-        "version": "v6_vox",
+        "version": "v4",
+        "channels_used": ["405"] if has_405 else [],
         "total_rois": int(len(feat_df)),
         "n_extracted": int(n_done),
         "n_missing": int(n_missing),
         "extraction_timestamp": datetime.utcnow().isoformat() + "Z",
-        "r_core_vox": float(R_CORE_VOX),
-        "bin_vox": float(BIN_VOX),
-        "neighbor_radius_vox": float(NEIGHBOR_RADIUS_VOX),
+        "seg_xy_um": vxy,
+        "seg_z_um": vz,
+        "r_core_um": float(r_core_um),
         "opening_radius_voxels": OPENING_RADIUS,
         "strip_z": STRIP_Z,
         "z_pad": Z_PAD,
         "elapsed_seconds": float(elapsed),
     }
-    with open(_meta_v6_path(sid), "w") as f:
+    with open(_meta_v4_path(sid), "w") as f:
         json.dump(meta, f, indent=2)
 
     sz = out_path.stat().st_size
@@ -329,10 +248,32 @@ def _extract_v6_subject(sid: str, force: bool = False) -> Dict:
     }
 
 
-def extract_v6_all(subjects: List[str], workers: int = 6, force: bool = False
-                   ) -> List[Dict]:
+def extract_v4_all(
+    subjects: List[str],
+    workers: int = 6,
+    r_core_um: float = R_CORE_UM_DEFAULT,
+    force: bool = False,
+) -> List[Dict]:
     ctx = get_context("spawn")
-    args = [(sid, force) for sid in subjects]
+    args = [(sid, r_core_um, force) for sid in subjects]
     with ctx.Pool(processes=min(workers, len(subjects))) as pool:
-        results = pool.starmap(_extract_v6_subject, args)
+        results = pool.starmap(_extract_v4_subject, args)
     return results
+
+
+# Public entry point used by features.extract_features.
+def compute(s, cache: bool = True) -> "pd.DataFrame":
+    """Compute (or load from cache) surface-area + sphericity + core/shell features.
+
+    `s` is a SubjectData instance (or any object with `.subject_id`).
+    Returns the cached parquet without re-extraction if it exists and cache=True.
+    """
+    from .benchmark_data_loader import SubjectData  # local import avoids circular dep
+    sid = s.subject_id if hasattr(s, "subject_id") else str(s)
+    out_path = _features_v4_cache_path(sid)
+    if cache and out_path.exists():
+        return pd.read_parquet(out_path)
+    result = _extract_v4_subject(sid, force=True)
+    if "error" in result:
+        raise RuntimeError(f"[{sid}] feat_surface extract failed: {result['error']}")
+    return pd.read_parquet(out_path)

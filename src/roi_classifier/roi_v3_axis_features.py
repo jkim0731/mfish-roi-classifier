@@ -1,6 +1,6 @@
 """v3 axis / projection / waist features for HCR ROI quality classifier.
 
-Pure functions; called per-cell from `roi_quality_v3.py`.
+Pure functions; called per-cell from `feat_axis.py`.
 
 Feature groups
 --------------
@@ -380,7 +380,7 @@ def projection_axis_features(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# top-level wrapper called per-cell from roi_quality_v3
+# top-level wrapper called per-cell from feat_axis
 # ──────────────────────────────────────────────────────────────────────────────
 
 _DROPPED_PEAK_COLS = frozenset({
