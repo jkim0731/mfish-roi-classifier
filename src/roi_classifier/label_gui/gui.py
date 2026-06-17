@@ -22,7 +22,7 @@ is drawn in red for the active label only.  The full crop volume is
 read once into RAM per ROI so scrubbing is instant.
 
 Labels are appended to
-    code/sessions/v3_S11_roi_quality/outputs/roi_qc_actions.jsonl
+    {MFISH_ROI_QUALITY_DIR}/roi_qc_actions.jsonl   (config.ROI_QUALITY_DIR)
 
 Keyboard:
     g  good      b  bad      u  unsure

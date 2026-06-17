@@ -2,6 +2,16 @@
 
 Subcommands
 -----------
+build-bbox <sid>
+    Build the per-cell tight-bbox cache (level-2 voxel frame) for subject
+    <sid> into config.TIGHT_BBOX_DIR.  This is the cold-start prerequisite the
+    shape/axis/surface feature extractors read.  --force rebuilds.
+
+build-features <sid>
+    Cold-start one subject end-to-end: build the tight-bbox cache (if needed)
+    then all four feature-group parquets into config.ROI_QUALITY_DIR, leaving
+    the subject ready for `predict`.
+
 predict <sid>
     Extract features (from cached parquets) and run inference for subject
     <sid>, writing the contract parquet to config.ROI_QUALITY_DIR:
@@ -16,7 +26,10 @@ train
 
 Usage examples
 --------------
+    # cold-start a fresh subject, then predict:
+    roi-classifier build-features 790322
     roi-classifier predict 790322
+
     MFISH_DATA_ROOT=/data roi-classifier predict 790322
     roi-classifier train
 """
@@ -108,6 +121,114 @@ def _cmd_train(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_build_bbox(args: argparse.Namespace) -> int:
+    from .feat_tight_bbox import build_tight_bbox_sid, tight_bbox_cache_path
+
+    sid = str(args.sid)
+    print(f"[build-bbox] subject={sid}")
+    df = build_tight_bbox_sid(sid, cache=True, force=args.force)
+    print(f"[build-bbox] {sid}: {len(df)} cells -> {tight_bbox_cache_path(sid)}")
+    return 0
+
+
+# Module-level workers so they are picklable for a spawn ProcessPool.
+# Each loads its own subject + zarr handles inside the worker process.
+def _crops_worker(sid: str, force: bool) -> str:
+    from .feat_per_cell_crops import build_per_cell_crops_sid
+    build_per_cell_crops_sid(sid, cache=True, force=force)
+    return "crops"
+
+
+def _feature_worker(sid: str, group: str) -> str:
+    from .benchmark_data_loader import load_subject
+    s = load_subject(sid)
+    mod = {
+        "shape": "feat_shape", "axis": "feat_axis",
+        "surface": "feat_surface", "protrusion": "feat_protrusion",
+    }[group]
+    import importlib
+    importlib.import_module(f".{mod}", __package__).compute(s, cache=True)
+    return group
+
+
+def _cmd_build_crops(args: argparse.Namespace) -> int:
+    from .feat_per_cell_crops import build_per_cell_crops_sid
+
+    sid = str(args.sid)
+    print(f"[build-crops] subject={sid}")
+    path = build_per_cell_crops_sid(sid, cache=True, force=args.force)
+    print(f"[build-crops] {sid}: -> {path}")
+    return 0
+
+
+def _cmd_build_features(args: argparse.Namespace) -> int:
+    """Cold-start a subject: tight-bbox -> per-cell crops -> all 4 feature groups.
+
+    Dependency DAG (parallelised when --jobs > 1):
+
+        bbox ──┬─→ crops ──┬─→ surface/v4
+               ├─→ shape/v2 └─→ protrusion/v5
+               └─→ axis/v3
+
+    bbox is the serial root; then crops + shape + axis run concurrently, and
+    surface + protrusion start once crops is ready.
+    """
+    from .benchmark_data_loader import load_subject
+    from .feat_tight_bbox import build_tight_bbox
+
+    sid = str(args.sid)
+    jobs = max(1, int(args.jobs))
+    print(f"[build-features] subject={sid}  jobs={jobs}")
+    s = load_subject(sid)
+
+    # Serial root: every group (and crops) needs the tight-bbox cache.
+    build_tight_bbox(s, cache=True, force=args.force)
+
+    if jobs <= 1:
+        from .feat_per_cell_crops import build_per_cell_crops
+        build_per_cell_crops(s, cache=True, force=args.force)
+        for g in ("shape", "axis", "surface", "protrusion"):
+            print(f"[build-features] {sid}: {g}")
+            _feature_worker(sid, g)
+        print(f"[build-features] {sid}: done — run `roi-classifier predict {sid}` next.")
+        return 0
+
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from multiprocessing import get_context
+    ctx = get_context("spawn")
+    errs: list[tuple[str, str]] = []
+    with ProcessPoolExecutor(max_workers=jobs, mp_context=ctx) as ex:
+        # crops + the two bbox-only groups can start immediately.
+        f_crops = ex.submit(_crops_worker, sid, args.force)
+        pending = {
+            ex.submit(_feature_worker, sid, "shape"): "shape",
+            ex.submit(_feature_worker, sid, "axis"): "axis",
+        }
+        # surface/v4 + protrusion/v5 need crops — submit once it finishes.
+        try:
+            f_crops.result()
+            print(f"[build-features] {sid}: crops ready — submitting surface/v4 + protrusion/v5")
+            pending[ex.submit(_feature_worker, sid, "surface")] = "surface"
+            pending[ex.submit(_feature_worker, sid, "protrusion")] = "protrusion"
+        except Exception as e:  # crops failed → v4/v5 cannot run
+            errs.append(("crops", str(e)))
+            print(f"[build-features] {sid}: crops FAILED: {e}", file=sys.stderr)
+        for fut in as_completed(pending):
+            g = pending[fut]
+            try:
+                fut.result()
+                print(f"[build-features] {sid}: {g} done")
+            except Exception as e:
+                errs.append((g, str(e)))
+                print(f"[build-features] {sid}: {g} FAILED: {e}", file=sys.stderr)
+
+    if errs:
+        print(f"[build-features] {sid}: FAILED groups: {[g for g, _ in errs]}", file=sys.stderr)
+        return 1
+    print(f"[build-features] {sid}: done — run `roi-classifier predict {sid}` next.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="roi-classifier",
@@ -117,6 +238,33 @@ def main(argv: list[str] | None = None) -> int:
 
     p_predict = sub.add_parser("predict", help="Run inference for one subject.")
     p_predict.add_argument("sid", help="Subject ID (e.g. 790322)")
+
+    p_bbox = sub.add_parser(
+        "build-bbox",
+        help="Build the per-cell tight-bbox cache for one subject (cold-start prerequisite).",
+    )
+    p_bbox.add_argument("sid", help="Subject ID (e.g. 790322)")
+    p_bbox.add_argument("--force", action="store_true",
+                        help="Rebuild even if the cache already exists.")
+
+    p_crops = sub.add_parser(
+        "build-crops",
+        help="Build the per-cell mask-crop cache (needs the tight-bbox cache first).",
+    )
+    p_crops.add_argument("sid", help="Subject ID (e.g. 790322)")
+    p_crops.add_argument("--force", action="store_true",
+                         help="Rebuild even if the cache already exists.")
+
+    p_feats = sub.add_parser(
+        "build-features",
+        help="Cold-start: build tight-bbox + all 4 feature-group parquets for one subject.",
+    )
+    p_feats.add_argument("sid", help="Subject ID (e.g. 790322)")
+    p_feats.add_argument("--force", action="store_true",
+                         help="Rebuild the tight-bbox/crops caches even if they exist.")
+    p_feats.add_argument("-j", "--jobs", type=int, default=4,
+                         help="Parallel worker processes for the feature groups "
+                              "(default 4; 1 = serial). bbox is always the serial root.")
 
     p_train = sub.add_parser("train", help="LOSO cross-validation + production model training.")
     p_train.add_argument(
@@ -131,6 +279,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "predict":
         return _cmd_predict(args)
+    if args.command == "build-bbox":
+        return _cmd_build_bbox(args)
+    if args.command == "build-crops":
+        return _cmd_build_crops(args)
+    if args.command == "build-features":
+        return _cmd_build_features(args)
     if args.command == "train":
         return _cmd_train(args)
     parser.print_help()

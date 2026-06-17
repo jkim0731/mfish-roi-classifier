@@ -65,11 +65,13 @@ def _extract_v4_subject(
 
     crops_path = PER_CELL_CROPS / f"{sid}_per_cell_crops.parquet"
     if not crops_path.exists():
-        return {"sid": sid, "error": f"missing crops: {crops_path}"}
+        return {"sid": sid, "error": f"missing crops: {crops_path} "
+                f"(build with `roi-classifier build-crops {sid}`)"}
 
     tb_path = TIGHT_BBOX_CACHE / f"{sid}_hcr_cell_tight_bbox_v1.parquet"
     if not tb_path.exists():
-        return {"sid": sid, "error": f"missing tight bbox cache: {tb_path}"}
+        return {"sid": sid, "error": f"missing tight bbox cache: {tb_path} "
+                f"(build with `roi-classifier build-bbox {sid}`)"}
 
     s = load_subject(sid)
     seg_orig = zarr.open(str(_orig_res_path(s)), mode="r")

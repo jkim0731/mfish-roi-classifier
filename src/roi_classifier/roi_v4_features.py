@@ -131,12 +131,23 @@ def core_shell_intensity_features(
 def shape_features(
     mask: np.ndarray, vz: float, vy: float, vx: float, prefix: str,
 ) -> Dict[str, float]:
-    # surface_area_um2 and volume_um3 are intermediate values only used for
-    # sphericity; the µm outputs were in DROP_UM_FEATURES and are not returned.
+    """µm surface-area / volume / SA:V / sphericity for one mask.
+
+    The µm outputs (surface_area_um2, volume_um3, sa_to_vol_um_inv) were
+    previously suppressed by DROP_UM_FEATURES; they are restored here because
+    the production v5d_um model (the um-vs-vox A/B winner) consumes them. See
+    docs/13 and the project memory on the um-vs-vox decision.
+    """
     sa = surface_area_um2(mask, vz, vy, vx)
     vol = volume_um3(mask, vz, vy, vx)
     sph = sphericity(vol, sa) if sa > 0 and vol > 0 else float("nan")
-    return {f"sphericity_{prefix}": sph}
+    sa_to_vol = float(sa / vol) if vol > 0 else float("nan")  # SA/V, units µm^-1
+    return {
+        f"surface_area_um2_{prefix}": sa,
+        f"volume_um3_{prefix}": vol,
+        f"sa_to_vol_um_inv_{prefix}": sa_to_vol,
+        f"sphericity_{prefix}": sph,
+    }
 
 
 def all_v4_features(
@@ -146,13 +157,24 @@ def all_v4_features(
     vz: float, vy: float, vx: float,
     r_core_um: float = R_CORE_UM_DEFAULT,
 ) -> Dict[str, float]:
-    # img_tight and r_core_um are accepted for API compatibility but not used;
-    # the µm core/shell outputs were in DROP_UM_FEATURES.
     out: Dict[str, float] = {}
     out.update(shape_features(mask_raw_tight, vz, vy, vx, prefix="raw"))
     out.update(shape_features(mask_opened_tight, vz, vy, vx, prefix="opened"))
+    # calibrated 4-µm core/shell 405 intensity (on the opened mask)
+    out.update(core_shell_intensity_features(
+        mask_opened_tight, img_tight, vz, vy, vx, r_core_um=r_core_um,
+    ))
     return out
 
 
 def feature_columns() -> list[str]:
-    return ["sphericity_raw", "sphericity_opened"]
+    return [
+        "surface_area_um2_raw", "surface_area_um2_opened",
+        "volume_um3_raw", "volume_um3_opened",
+        "sa_to_vol_um_inv_raw", "sa_to_vol_um_inv_opened",
+        "sphericity_raw", "sphericity_opened",
+        "core4um_voxel_frac_opened",
+        "c405_core4um_p50_opened", "c405_shell4um_p50_opened",
+        "c405_shell_minus_core4um_p50", "c405_shell_minus_core4um_p90",
+        "c405_shell_over_core4um_p50_ratio",
+    ]

@@ -44,7 +44,7 @@ Output schema (~42 features, all numeric or bool):
 
 Coordinates / data sources are identical to v1: level-2
 `segmentation_mask_orig_res.zarr` and `image_tile_fusing/fused/channel_405.zarr`
-`["2"]`.  See `roi_quality.py` for details.
+`["2"]`.  (Historical detail lived in the now-removed `roi_quality.py`.)
 
 Strategy
 --------
@@ -77,7 +77,7 @@ from tqdm import tqdm
 
 warnings.filterwarnings("ignore", category=UserWarning, module="zarr")
 
-from .benchmark_data_loader import SubjectData
+from .benchmark_data_loader import SubjectData, load_subject
 from . import config as _cfg
 
 
@@ -173,6 +173,13 @@ def _shape_stats(
         "aspect_yx": float("nan"),
         "solidity": float("nan"),
         "bbox_occupancy": float("nan"),
+        # µm outputs (restored for the production v5d_um model — were dropped
+        # by DROP_UM_FEATURES; see the um-vs-vox decision record).
+        "volume_um3": float("nan"),
+        "bbox_z_extent_um": float("nan"),
+        "bbox_y_extent_um": float("nan"),
+        "bbox_x_extent_um": float("nan"),
+        "equivalent_diameter_um": float("nan"),
     }
     n = int(binary.sum())
     if n == 0:
@@ -193,10 +200,18 @@ def _shape_stats(
     bbox_vol = max(dz * dy * dx, 1)
     out["bbox_occupancy"] = n / bbox_vol
 
+    out["bbox_z_extent_um"] = bbox_z
+    out["bbox_y_extent_um"] = bbox_y
+    out["bbox_x_extent_um"] = bbox_x
+    volume_um3 = n * seg_z_um * seg_xy_um * seg_xy_um
+    out["volume_um3"] = float(volume_um3)
+    out["equivalent_diameter_um"] = float(
+        2.0 * (3.0 * volume_um3 / (4.0 * np.pi)) ** (1.0 / 3.0)
+    )
+
     if n > 7:
         try:
             from scipy.spatial import ConvexHull
-            volume_um3 = n * seg_z_um * seg_xy_um * seg_xy_um
             pts_um = np.column_stack([
                 zz * seg_z_um,
                 yy * seg_xy_um,
@@ -252,9 +267,13 @@ def _knn_features(
 ) -> pd.DataFrame:
     N = len(query_um)
     if N == 0 or tree is None:
-        return pd.DataFrame({"knn_d1": np.full(N, float("nan"))})
+        return pd.DataFrame({
+            "knn_d1": np.full(N, float("nan")),
+            "n_neighbors_30um": np.full(N, float("nan")),
+        })
     valid = np.isfinite(query_um).all(axis=1)
     knn_d1 = np.full(N, float("nan"))
+    n_neighbors = np.full(N, float("nan"))
     if valid.any():
         # k=2 because query points are themselves in the tree → first neighbour is self
         d, _ = tree.query(query_um[valid], k=min(2, pts_um.shape[0]), workers=1)
@@ -262,7 +281,11 @@ def _knn_features(
             d = d[:, None]
         if d.shape[1] >= 2:
             knn_d1[valid] = d[:, 1]
-    return pd.DataFrame({"knn_d1": knn_d1})
+        # n_neighbors_30um: count of OTHER cells within `radius` µm (exclude self).
+        # query points are in the tree, so subtract 1.
+        counts = tree.query_ball_point(query_um[valid], radius, return_length=True)
+        n_neighbors[valid] = np.asarray(counts, dtype=float) - 1.0
+    return pd.DataFrame({"knn_d1": knn_d1, "n_neighbors_30um": n_neighbors})
 
 
 
@@ -270,6 +293,285 @@ def _knn_features(
 # ──────────────────────────────────────────────────────────────────────────────
 # main extractor
 # ──────────────────────────────────────────────────────────────────────────────
+
+# ── z-strip parallelism (within-mouse; max-core) ──────────────────────────────
+_V2CTX: Dict = {}
+
+
+def _feat_workers(n_items: int) -> int:
+    """Worker count for strip-level parallelism: MFISH_FEAT_WORKERS or cpu-2."""
+    import os as _os
+    env = _os.environ.get("MFISH_FEAT_WORKERS")
+    if env:
+        try:
+            w = int(env)
+        except ValueError:
+            w = 1
+    else:
+        w = max(1, (_os.cpu_count() or 2) - 2)
+    return max(1, min(w, max(1, n_items)))
+
+
+def _v2_worker_init(sid, ctx_light):
+    s = load_subject(sid)
+    _V2CTX.clear()
+    _V2CTX.update(ctx_light)
+    _V2CTX["seg_orig"] = zarr.open(str(_orig_res_path(s)), mode="r")
+    _V2CTX["arr405"] = _ch405_l2(s)
+    _V2CTX["has_405"] = _V2CTX["arr405"] is not None
+
+
+def _process_strip_v2(z0_inner):
+    """Process one z-strip; returns (rows, n_owned, n_oversized, n_missing)."""
+    C = _V2CTX
+    seg_orig = C["seg_orig"]; arr405 = C["arr405"]; has_405 = C["has_405"]
+    Z_seg = C["Z_seg"]; Y_seg = C["Y_seg"]; X_seg = C["X_seg"]
+    seg_z_um = C["seg_z_um"]; seg_xy_um = C["seg_xy_um"]
+    tb_lookup = C["tb_lookup"]; cent_z = C["cent_z"]; stage1 = C["stage1"]
+    cells_per_strip = C["cells_per_strip"]; z_hi_global = C["z_hi_global"]
+    n_owned = 0
+    n_oversized = 0
+    n_missing_in_zarr = 0
+    feature_rows: List[Dict] = []
+    z1_inner = min(z0_inner + STRIP_Z, z_hi_global)
+    z0_load = max(0, z0_inner - Z_PAD)
+    z1_load = min(Z_seg, z1_inner + Z_PAD)
+
+    # Determine which y/x sub-region we actually need to load: union of all
+    # owned cells' bboxes ± pad. This avoids loading the full Y×X plane
+    # when the cells in this strip occupy only part of it.
+    owned = cells_per_strip[z0_inner]
+    own_bbs = [tb_lookup.get(h) for h in owned if h in tb_lookup]
+    if not own_bbs:
+        return feature_rows, n_owned, n_oversized, n_missing_in_zarr
+    y_min = min(b[2] for b in own_bbs)
+    y_max = max(b[3] for b in own_bbs)
+    x_min = min(b[4] for b in own_bbs)
+    x_max = max(b[5] for b in own_bbs)
+    pad = OPENING_RADIUS + 1
+    sub_y0 = max(0, y_min - pad)
+    sub_y1 = min(Y_seg, y_max + pad)
+    sub_x0 = max(0, x_min - pad)
+    sub_x1 = min(X_seg, x_max + pad)
+
+    seg_block = np.asarray(
+        seg_orig[0, 0, z0_load:z1_load, sub_y0:sub_y1, sub_x0:sub_x1]
+    )
+    if has_405:
+        ch405_block = np.asarray(
+            arr405[0, 0, z0_load:z1_load, sub_y0:sub_y1, sub_x0:sub_x1]
+        ).astype(np.float32)
+        if ch405_block.shape != seg_block.shape:
+            ch405_block = ch405_block[: seg_block.shape[0],
+                                       : seg_block.shape[1],
+                                       : seg_block.shape[2]]
+    else:
+        ch405_block = None
+
+    for hid in owned:
+        tb = tb_lookup.get(hid)
+        if tb is None:
+            continue
+        zmin, zmax_ex, ymin, ymax_ex, xmin, xmax_ex = tb
+        n_owned += 1
+
+        cz = cent_z.get(hid, (zmin + zmax_ex) // 2)
+        half_extent = max(cz - zmin, zmax_ex - 1 - cz)
+        if half_extent + OPENING_RADIUS + 1 > Z_PAD:
+            n_oversized += 1
+
+        # Padded crop bounds in *global* level-2 coords.
+        psz0_g = max(0, zmin - pad)
+        psz1_g = min(Z_seg, zmax_ex + pad)
+        psy0_g = max(0, ymin - pad)
+        psy1_g = min(Y_seg, ymax_ex + pad)
+        psx0_g = max(0, xmin - pad)
+        psx1_g = min(X_seg, xmax_ex + pad)
+
+        # Translate into block indices.
+        bz0 = psz0_g - z0_load
+        bz1 = psz1_g - z0_load
+        by0 = psy0_g - sub_y0
+        by1 = psy1_g - sub_y0
+        bx0 = psx0_g - sub_x0
+        bx1 = psx1_g - sub_x0
+
+        if (bz0 < 0 or bz1 > seg_block.shape[0]
+                or by0 < 0 or by1 > seg_block.shape[1]
+                or bx0 < 0 or bx1 > seg_block.shape[2]):
+            # Cell padded crop overflows the loaded sub-block (rare; at
+            # z-strip edges for very tall cells). Skip this cell — it'll
+            # be left as missing and emit NaN below.
+            n_missing_in_zarr += 1
+            continue
+
+        seg_crop = seg_block[bz0:bz1, by0:by1, bx0:bx1]
+        mask_crop = seg_crop == hid
+        if not mask_crop.any():
+            n_missing_in_zarr += 1
+            continue
+
+        n_raw = int(mask_crop.sum())
+
+        # tight subview within padded crop
+        tz0 = zmin - psz0_g
+        ty0 = ymin - psy0_g
+        tx0 = xmin - psx0_g
+        tz1 = tz0 + (zmax_ex - zmin)
+        ty1 = ty0 + (ymax_ex - ymin)
+        tx1 = tx0 + (xmax_ex - xmin)
+        mask_raw_tight = mask_crop[tz0:tz1, ty0:ty1, tx0:tx1]
+        shape_raw = _shape_stats(mask_raw_tight, seg_z_um, seg_xy_um)
+
+        # ── opening: cross+iter octahedral approximation, ≥10× faster
+        #    than ball-r=3 footprint.
+        mask_opened = ndi.binary_opening(
+            mask_crop, structure=_CROSS_3D, iterations=OPENING_RADIUS,
+        )
+        mask_opened_tight = mask_opened[tz0:tz1, ty0:ty1, tx0:tx1]
+        n_opened = int(mask_opened_tight.sum())
+        shape_opened = _shape_stats(mask_opened_tight, seg_z_um, seg_xy_um)
+        frac_kept = n_opened / n_raw if n_raw > 0 else float("nan")
+
+        # ── core / shell on opened mask ────────────────────────────────
+        if n_opened > 0:
+            core_full = ndi.binary_erosion(
+                mask_opened, structure=_CROSS_3D, iterations=EROSION_CORE_RADIUS,
+            )
+            core_tight = core_full[tz0:tz1, ty0:ty1, tx0:tx1]
+            shell_tight = mask_opened_tight & ~core_tight
+        else:
+            core_tight = np.zeros_like(mask_opened_tight)
+            shell_tight = np.zeros_like(mask_opened_tight)
+
+        # ── 405 raw / opened / core / shell ─────────────────────────────
+        if ch405_block is not None:
+            img_pad = ch405_block[bz0:bz1, by0:by1, bx0:bx1]
+            img_tight = img_pad[tz0:tz1, ty0:ty1, tx0:tx1]
+            px_raw = img_tight[mask_raw_tight]
+            px_opened = img_tight[mask_opened_tight] if n_opened > 0 else np.array([], dtype=np.float32)
+            px_core = img_tight[core_tight] if core_tight.any() else np.array([], dtype=np.float32)
+            px_shell = img_tight[shell_tight] if shell_tight.any() else np.array([], dtype=np.float32)
+        else:
+            px_raw = px_opened = px_core = px_shell = np.array([], dtype=np.float32)
+            img_pad = None
+
+        i_raw = _intensity_stats(px_raw)
+        i_opened = _intensity_stats(px_opened)
+        core_p50 = _percentile_or_nan(px_core, 50)
+        shell_p50 = _percentile_or_nan(px_shell, 50)
+        shell_p90 = _percentile_or_nan(px_shell, 90)
+        core_p90 = _percentile_or_nan(px_core, 90)
+        shell_minus_core_p50 = (
+            shell_p50 - core_p50 if np.isfinite(shell_p50) and np.isfinite(core_p50) else float("nan")
+        )
+        shell_minus_core_p90 = (
+            shell_p90 - core_p90 if np.isfinite(shell_p90) and np.isfinite(core_p90) else float("nan")
+        )
+
+        # ── adjacency / outside (rim from raw mask, dilation r=1) ──────
+        mask_rim_full = ndi.binary_dilation(
+            mask_crop, structure=_CROSS_3D, iterations=RIM_RADIUS,
+        ) & ~mask_crop
+        n_rim = int(mask_rim_full.sum())
+        if n_rim > 0:
+            rim_labels = seg_crop[mask_rim_full]
+            # other hcr_ids
+            fg_mask_in_rim = rim_labels != 0
+            fg_ids = rim_labels[fg_mask_in_rim]
+            if fg_ids.size > 0:
+                uniq_ids, counts = np.unique(fg_ids, return_counts=True)
+                surface_touching_frac = float(fg_ids.size) / n_rim
+                top_neighbor_overlap_frac = float(counts.max()) / n_rim
+                n_touching = int(uniq_ids.size)
+                nbr_scores = [stage1.get(int(u)) for u in uniq_ids]
+                nbr_scores = [v for v in nbr_scores if v is not None and np.isfinite(v)]
+                if nbr_scores:
+                    mean_score = float(np.mean(nbr_scores))
+                    min_score = float(np.min(nbr_scores))
+                else:
+                    mean_score = float("nan")
+                    min_score = float("nan")
+            else:
+                surface_touching_frac = 0.0
+                top_neighbor_overlap_frac = 0.0
+                n_touching = 0
+                mean_score = float("nan")
+                min_score = float("nan")
+        else:
+            surface_touching_frac = float("nan")
+            top_neighbor_overlap_frac = float("nan")
+            n_touching = 0
+            mean_score = float("nan")
+            min_score = float("nan")
+
+        # ── 405 inside vs outside (using rim of raw) ───────────────────
+        if ch405_block is not None and n_rim > 0:
+            px_outside = img_pad[mask_rim_full]
+            outside_p50 = _percentile_or_nan(px_outside, 50)
+            outside_p90 = _percentile_or_nan(px_outside, 90)
+        else:
+            outside_p50 = outside_p90 = float("nan")
+        inside_minus_outside_p50 = (
+            i_raw["p50"] - outside_p50
+            if np.isfinite(i_raw["p50"]) and np.isfinite(outside_p50) else float("nan")
+        )
+        inside_minus_outside_p90 = (
+            i_raw["p90"] - outside_p90
+            if np.isfinite(i_raw["p90"]) and np.isfinite(outside_p90) else float("nan")
+        )
+
+        row = {
+            "hcr_id": hid,
+            # shape raw
+            "volume_vox_raw": shape_raw["volume_vox"],
+            "aspect_zy": shape_raw["aspect_zy"],
+            "aspect_zx": shape_raw["aspect_zx"],
+            "aspect_yx": shape_raw["aspect_yx"],
+            "solidity_raw": shape_raw["solidity"],
+            "bbox_occupancy_raw": shape_raw["bbox_occupancy"],
+            # shape opened
+            "volume_vox_opened": shape_opened["volume_vox"],
+            "frac_kept_opening": frac_kept,
+            "solidity_opened": shape_opened["solidity"],
+            # shape µm (volume/bbox from raw mask; equiv-diam raw + opened)
+            "volume_um3_raw": shape_raw["volume_um3"],
+            "bbox_z_extent_um": shape_raw["bbox_z_extent_um"],
+            "bbox_y_extent_um": shape_raw["bbox_y_extent_um"],
+            "bbox_x_extent_um": shape_raw["bbox_x_extent_um"],
+            "equivalent_diameter_um_raw": shape_raw["equivalent_diameter_um"],
+            "equivalent_diameter_um_opened": shape_opened["equivalent_diameter_um"],
+            # 405 raw
+            "c405_raw_mean": i_raw["mean"],
+            "c405_raw_std": i_raw["std"],
+            "c405_raw_p10": i_raw["p10"],
+            "c405_raw_p50": i_raw["p50"],
+            "c405_raw_p90": i_raw["p90"],
+            # 405 opened
+            "c405_opened_mean": i_opened["mean"],
+            "c405_opened_std": i_opened["std"],
+            "c405_opened_p10": i_opened["p10"],
+            "c405_opened_p50": i_opened["p50"],
+            "c405_opened_p90": i_opened["p90"],
+            # 405 core vs shell
+            "c405_core_p50_opened": core_p50,
+            "c405_shell_p50_opened": shell_p50,
+            "c405_shell_minus_core_p50": shell_minus_core_p50,
+            "c405_shell_minus_core_p90": shell_minus_core_p90,
+            # 405 inside vs outside
+            "c405_outside_p50": outside_p50,
+            "c405_inside_minus_outside_p50": inside_minus_outside_p50,
+            "c405_inside_minus_outside_p90": inside_minus_outside_p90,
+            # adjacency
+            "n_touching_neighbors": n_touching,
+            "surface_touching_frac": surface_touching_frac,
+            "top_neighbor_overlap_frac": top_neighbor_overlap_frac,
+            "mean_touching_score_stage1": mean_score,
+            "min_touching_score_stage1": min_score,
+        }
+        feature_rows.append(row)
+    return feature_rows, n_owned, n_oversized, n_missing_in_zarr
+
 
 def extract_roi_features_v2(
     s: SubjectData,
@@ -335,8 +637,8 @@ def extract_roi_features_v2(
     tb_path = TIGHT_BBOX_CACHE / f"{sid}_hcr_cell_tight_bbox_v1.parquet"
     if not tb_path.exists():
         raise FileNotFoundError(
-            f"tight bbox cache missing: {tb_path}.  Run roi_quality.extract_roi_features "
-            f"first to populate it."
+            f"tight bbox cache missing: {tb_path}.  Build it first with "
+            f"`roi-classifier build-bbox {sid}` (or feat_tight_bbox.build_tight_bbox_sid)."
         )
     tb_df = pd.read_parquet(tb_path)
     tb_lookup: Dict[int, Tuple[int, int, int, int, int, int]] = {
@@ -367,240 +669,32 @@ def extract_roi_features_v2(
     n_oversized = 0
     n_missing_in_zarr = 0
     z_strips = sorted(cells_per_strip.keys())
-    for z0_inner in tqdm(z_strips, desc=f"[{sid}] v2 z-strips", unit="strip"):
-        z1_inner = min(z0_inner + STRIP_Z, z_hi_global)
-        z0_load = max(0, z0_inner - Z_PAD)
-        z1_load = min(Z_seg, z1_inner + Z_PAD)
-
-        # Determine which y/x sub-region we actually need to load: union of all
-        # owned cells' bboxes ± pad. This avoids loading the full Y×X plane
-        # when the cells in this strip occupy only part of it.
-        owned = cells_per_strip[z0_inner]
-        own_bbs = [tb_lookup.get(h) for h in owned if h in tb_lookup]
-        if not own_bbs:
-            continue
-        y_min = min(b[2] for b in own_bbs)
-        y_max = max(b[3] for b in own_bbs)
-        x_min = min(b[4] for b in own_bbs)
-        x_max = max(b[5] for b in own_bbs)
-        pad = OPENING_RADIUS + 1
-        sub_y0 = max(0, y_min - pad)
-        sub_y1 = min(Y_seg, y_max + pad)
-        sub_x0 = max(0, x_min - pad)
-        sub_x1 = min(X_seg, x_max + pad)
-
-        seg_block = np.asarray(
-            seg_orig[0, 0, z0_load:z1_load, sub_y0:sub_y1, sub_x0:sub_x1]
-        )
-        if has_405:
-            ch405_block = np.asarray(
-                arr405[0, 0, z0_load:z1_load, sub_y0:sub_y1, sub_x0:sub_x1]
-            ).astype(np.float32)
-            if ch405_block.shape != seg_block.shape:
-                ch405_block = ch405_block[: seg_block.shape[0],
-                                           : seg_block.shape[1],
-                                           : seg_block.shape[2]]
-        else:
-            ch405_block = None
-
-        for hid in owned:
-            tb = tb_lookup.get(hid)
-            if tb is None:
-                continue
-            zmin, zmax_ex, ymin, ymax_ex, xmin, xmax_ex = tb
-            n_owned += 1
-
-            cz = cent_z.get(hid, (zmin + zmax_ex) // 2)
-            half_extent = max(cz - zmin, zmax_ex - 1 - cz)
-            if half_extent + OPENING_RADIUS + 1 > Z_PAD:
-                n_oversized += 1
-
-            # Padded crop bounds in *global* level-2 coords.
-            psz0_g = max(0, zmin - pad)
-            psz1_g = min(Z_seg, zmax_ex + pad)
-            psy0_g = max(0, ymin - pad)
-            psy1_g = min(Y_seg, ymax_ex + pad)
-            psx0_g = max(0, xmin - pad)
-            psx1_g = min(X_seg, xmax_ex + pad)
-
-            # Translate into block indices.
-            bz0 = psz0_g - z0_load
-            bz1 = psz1_g - z0_load
-            by0 = psy0_g - sub_y0
-            by1 = psy1_g - sub_y0
-            bx0 = psx0_g - sub_x0
-            bx1 = psx1_g - sub_x0
-
-            if (bz0 < 0 or bz1 > seg_block.shape[0]
-                    or by0 < 0 or by1 > seg_block.shape[1]
-                    or bx0 < 0 or bx1 > seg_block.shape[2]):
-                # Cell padded crop overflows the loaded sub-block (rare; at
-                # z-strip edges for very tall cells). Skip this cell — it'll
-                # be left as missing and emit NaN below.
-                n_missing_in_zarr += 1
-                continue
-
-            seg_crop = seg_block[bz0:bz1, by0:by1, bx0:bx1]
-            mask_crop = seg_crop == hid
-            if not mask_crop.any():
-                n_missing_in_zarr += 1
-                continue
-
-            n_raw = int(mask_crop.sum())
-
-            # tight subview within padded crop
-            tz0 = zmin - psz0_g
-            ty0 = ymin - psy0_g
-            tx0 = xmin - psx0_g
-            tz1 = tz0 + (zmax_ex - zmin)
-            ty1 = ty0 + (ymax_ex - ymin)
-            tx1 = tx0 + (xmax_ex - xmin)
-            mask_raw_tight = mask_crop[tz0:tz1, ty0:ty1, tx0:tx1]
-            shape_raw = _shape_stats(mask_raw_tight, seg_z_um, seg_xy_um)
-
-            # ── opening: cross+iter octahedral approximation, ≥10× faster
-            #    than ball-r=3 footprint.
-            mask_opened = ndi.binary_opening(
-                mask_crop, structure=_CROSS_3D, iterations=OPENING_RADIUS,
-            )
-            mask_opened_tight = mask_opened[tz0:tz1, ty0:ty1, tx0:tx1]
-            n_opened = int(mask_opened_tight.sum())
-            shape_opened = _shape_stats(mask_opened_tight, seg_z_um, seg_xy_um)
-            frac_kept = n_opened / n_raw if n_raw > 0 else float("nan")
-
-            # ── core / shell on opened mask ────────────────────────────────
-            if n_opened > 0:
-                core_full = ndi.binary_erosion(
-                    mask_opened, structure=_CROSS_3D, iterations=EROSION_CORE_RADIUS,
-                )
-                core_tight = core_full[tz0:tz1, ty0:ty1, tx0:tx1]
-                shell_tight = mask_opened_tight & ~core_tight
-            else:
-                core_tight = np.zeros_like(mask_opened_tight)
-                shell_tight = np.zeros_like(mask_opened_tight)
-
-            # ── 405 raw / opened / core / shell ─────────────────────────────
-            if ch405_block is not None:
-                img_pad = ch405_block[bz0:bz1, by0:by1, bx0:bx1]
-                img_tight = img_pad[tz0:tz1, ty0:ty1, tx0:tx1]
-                px_raw = img_tight[mask_raw_tight]
-                px_opened = img_tight[mask_opened_tight] if n_opened > 0 else np.array([], dtype=np.float32)
-                px_core = img_tight[core_tight] if core_tight.any() else np.array([], dtype=np.float32)
-                px_shell = img_tight[shell_tight] if shell_tight.any() else np.array([], dtype=np.float32)
-            else:
-                px_raw = px_opened = px_core = px_shell = np.array([], dtype=np.float32)
-                img_pad = None
-
-            i_raw = _intensity_stats(px_raw)
-            i_opened = _intensity_stats(px_opened)
-            core_p50 = _percentile_or_nan(px_core, 50)
-            shell_p50 = _percentile_or_nan(px_shell, 50)
-            shell_p90 = _percentile_or_nan(px_shell, 90)
-            core_p90 = _percentile_or_nan(px_core, 90)
-            shell_minus_core_p50 = (
-                shell_p50 - core_p50 if np.isfinite(shell_p50) and np.isfinite(core_p50) else float("nan")
-            )
-            shell_minus_core_p90 = (
-                shell_p90 - core_p90 if np.isfinite(shell_p90) and np.isfinite(core_p90) else float("nan")
-            )
-
-            # ── adjacency / outside (rim from raw mask, dilation r=1) ──────
-            mask_rim_full = ndi.binary_dilation(
-                mask_crop, structure=_CROSS_3D, iterations=RIM_RADIUS,
-            ) & ~mask_crop
-            n_rim = int(mask_rim_full.sum())
-            if n_rim > 0:
-                rim_labels = seg_crop[mask_rim_full]
-                # other hcr_ids
-                fg_mask_in_rim = rim_labels != 0
-                fg_ids = rim_labels[fg_mask_in_rim]
-                if fg_ids.size > 0:
-                    uniq_ids, counts = np.unique(fg_ids, return_counts=True)
-                    surface_touching_frac = float(fg_ids.size) / n_rim
-                    top_neighbor_overlap_frac = float(counts.max()) / n_rim
-                    n_touching = int(uniq_ids.size)
-                    nbr_scores = [stage1.get(int(u)) for u in uniq_ids]
-                    nbr_scores = [v for v in nbr_scores if v is not None and np.isfinite(v)]
-                    if nbr_scores:
-                        mean_score = float(np.mean(nbr_scores))
-                        min_score = float(np.min(nbr_scores))
-                    else:
-                        mean_score = float("nan")
-                        min_score = float("nan")
-                else:
-                    surface_touching_frac = 0.0
-                    top_neighbor_overlap_frac = 0.0
-                    n_touching = 0
-                    mean_score = float("nan")
-                    min_score = float("nan")
-            else:
-                surface_touching_frac = float("nan")
-                top_neighbor_overlap_frac = float("nan")
-                n_touching = 0
-                mean_score = float("nan")
-                min_score = float("nan")
-
-            # ── 405 inside vs outside (using rim of raw) ───────────────────
-            if ch405_block is not None and n_rim > 0:
-                px_outside = img_pad[mask_rim_full]
-                outside_p50 = _percentile_or_nan(px_outside, 50)
-                outside_p90 = _percentile_or_nan(px_outside, 90)
-            else:
-                outside_p50 = outside_p90 = float("nan")
-            inside_minus_outside_p50 = (
-                i_raw["p50"] - outside_p50
-                if np.isfinite(i_raw["p50"]) and np.isfinite(outside_p50) else float("nan")
-            )
-            inside_minus_outside_p90 = (
-                i_raw["p90"] - outside_p90
-                if np.isfinite(i_raw["p90"]) and np.isfinite(outside_p90) else float("nan")
-            )
-
-            row = {
-                "hcr_id": hid,
-                # shape raw
-                "volume_vox_raw": shape_raw["volume_vox"],
-                "aspect_zy": shape_raw["aspect_zy"],
-                "aspect_zx": shape_raw["aspect_zx"],
-                "aspect_yx": shape_raw["aspect_yx"],
-                "solidity_raw": shape_raw["solidity"],
-                "bbox_occupancy_raw": shape_raw["bbox_occupancy"],
-                # shape opened
-                "volume_vox_opened": shape_opened["volume_vox"],
-                "frac_kept_opening": frac_kept,
-                "solidity_opened": shape_opened["solidity"],
-                # 405 raw
-                "c405_raw_mean": i_raw["mean"],
-                "c405_raw_std": i_raw["std"],
-                "c405_raw_p10": i_raw["p10"],
-                "c405_raw_p50": i_raw["p50"],
-                "c405_raw_p90": i_raw["p90"],
-                # 405 opened
-                "c405_opened_mean": i_opened["mean"],
-                "c405_opened_std": i_opened["std"],
-                "c405_opened_p10": i_opened["p10"],
-                "c405_opened_p50": i_opened["p50"],
-                "c405_opened_p90": i_opened["p90"],
-                # 405 core vs shell
-                "c405_core_p50_opened": core_p50,
-                "c405_shell_p50_opened": shell_p50,
-                "c405_shell_minus_core_p50": shell_minus_core_p50,
-                "c405_shell_minus_core_p90": shell_minus_core_p90,
-                # 405 inside vs outside
-                "c405_outside_p50": outside_p50,
-                "c405_inside_minus_outside_p50": inside_minus_outside_p50,
-                "c405_inside_minus_outside_p90": inside_minus_outside_p90,
-                # adjacency
-                "n_touching_neighbors": n_touching,
-                "surface_touching_frac": surface_touching_frac,
-                "top_neighbor_overlap_frac": top_neighbor_overlap_frac,
-                "mean_touching_score_stage1": mean_score,
-                "min_touching_score_stage1": min_score,
-            }
-            feature_rows.append(row)
-
-    print(f"  [{sid}] z-strip pass done | owned={n_owned} | "
-          f"oversized={n_oversized} | missing_in_zarr={n_missing_in_zarr}")
+    _ctx_light = dict(
+        Z_seg=Z_seg, Y_seg=Y_seg, X_seg=X_seg,
+        seg_z_um=seg_z_um, seg_xy_um=seg_xy_um,
+        tb_lookup=tb_lookup, cent_z=cent_z, stage1=stage1,
+        cells_per_strip=cells_per_strip, z_hi_global=z_hi_global,
+    )
+    workers = _feat_workers(len(z_strips))
+    print(f"  [{sid}] v2 z-strips={len(z_strips)} workers={workers}")
+    if workers <= 1:
+        _V2CTX.clear(); _V2CTX.update(_ctx_light)
+        _V2CTX["seg_orig"] = seg_orig
+        _V2CTX["arr405"] = arr405
+        _V2CTX["has_405"] = has_405
+        results = [_process_strip_v2(z0) for z0 in z_strips]
+    else:
+        from concurrent.futures import ProcessPoolExecutor
+        from multiprocessing import get_context
+        with ProcessPoolExecutor(max_workers=workers, mp_context=get_context("spawn"),
+                                 initializer=_v2_worker_init,
+                                 initargs=(sid, _ctx_light)) as _ex:
+            results = list(_ex.map(_process_strip_v2, z_strips))
+    for _rows, _no, _nov, _nm in results:
+        feature_rows.extend(_rows)
+        n_owned += _no
+        n_oversized += _nov
+        n_missing_in_zarr += _nm
 
     # Cells in centroid table that we never owned (e.g., centroid in seg gap).
     # Emit NaN rows so output schema covers all hcr_ids.
@@ -610,6 +704,9 @@ def extract_roi_features_v2(
             "aspect_zy", "aspect_zx", "aspect_yx",
             "solidity_raw", "bbox_occupancy_raw",
             "volume_vox_opened", "frac_kept_opening", "solidity_opened",
+            "volume_um3_raw", "bbox_z_extent_um", "bbox_y_extent_um",
+            "bbox_x_extent_um", "equivalent_diameter_um_raw",
+            "equivalent_diameter_um_opened",
             "c405_raw_mean", "c405_raw_std", "c405_raw_p10", "c405_raw_p50", "c405_raw_p90",
             "c405_opened_mean", "c405_opened_std", "c405_opened_p10", "c405_opened_p50", "c405_opened_p90",
             "c405_core_p50_opened", "c405_shell_p50_opened",
