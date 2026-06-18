@@ -162,69 +162,23 @@ def _cmd_build_crops(args: argparse.Namespace) -> int:
 
 
 def _cmd_build_features(args: argparse.Namespace) -> int:
-    """Cold-start a subject: tight-bbox -> per-cell crops -> all 4 feature groups.
+    """Cold-start a subject: tight-bbox -> unified single-pass feature extraction.
 
-    Dependency DAG (parallelised when --jobs > 1):
-
-        bbox ──┬─→ crops ──┬─→ surface/v4
-               ├─→ shape/v2 └─→ protrusion/v5
-               └─→ axis/v3
-
-    bbox is the serial root; then crops + shape + axis run concurrently, and
-    surface + protrusion start once crops is ready.
+    One extractor computes all feature families (shape, axis, surface,
+    protrusion, intensity, adjacency) in a single z-strip pass — each cell's
+    mask, opening, and 405 crop are computed once and shared across families
+    (no redundant volume reads, no per-cell-crops cache). The z-strip loop
+    parallelises across cores via `MFISH_FEAT_WORKERS` (default cpu-2).
     """
     from .benchmark_data_loader import load_subject
     from .feat_tight_bbox import build_tight_bbox
+    from . import feat_shape
 
     sid = str(args.sid)
-    jobs = max(1, int(args.jobs))
-    print(f"[build-features] subject={sid}  jobs={jobs}")
+    print(f"[build-features] subject={sid}")
     s = load_subject(sid)
-
-    # Serial root: every group (and crops) needs the tight-bbox cache.
-    build_tight_bbox(s, cache=True, force=args.force)
-
-    if jobs <= 1:
-        from .feat_per_cell_crops import build_per_cell_crops
-        build_per_cell_crops(s, cache=True, force=args.force)
-        for g in ("shape", "axis", "surface", "protrusion"):
-            print(f"[build-features] {sid}: {g}")
-            _feature_worker(sid, g)
-        print(f"[build-features] {sid}: done — run `roi-classifier predict {sid}` next.")
-        return 0
-
-    from concurrent.futures import ProcessPoolExecutor, as_completed
-    from multiprocessing import get_context
-    ctx = get_context("spawn")
-    errs: list[tuple[str, str]] = []
-    with ProcessPoolExecutor(max_workers=jobs, mp_context=ctx) as ex:
-        # crops + the two bbox-only groups can start immediately.
-        f_crops = ex.submit(_crops_worker, sid, args.force)
-        pending = {
-            ex.submit(_feature_worker, sid, "shape"): "shape",
-            ex.submit(_feature_worker, sid, "axis"): "axis",
-        }
-        # surface/v4 + protrusion/v5 need crops — submit once it finishes.
-        try:
-            f_crops.result()
-            print(f"[build-features] {sid}: crops ready — submitting surface/v4 + protrusion/v5")
-            pending[ex.submit(_feature_worker, sid, "surface")] = "surface"
-            pending[ex.submit(_feature_worker, sid, "protrusion")] = "protrusion"
-        except Exception as e:  # crops failed → v4/v5 cannot run
-            errs.append(("crops", str(e)))
-            print(f"[build-features] {sid}: crops FAILED: {e}", file=sys.stderr)
-        for fut in as_completed(pending):
-            g = pending[fut]
-            try:
-                fut.result()
-                print(f"[build-features] {sid}: {g} done")
-            except Exception as e:
-                errs.append((g, str(e)))
-                print(f"[build-features] {sid}: {g} FAILED: {e}", file=sys.stderr)
-
-    if errs:
-        print(f"[build-features] {sid}: FAILED groups: {[g for g, _ in errs]}", file=sys.stderr)
-        return 1
+    build_tight_bbox(s, cache=True, force=args.force)   # locates cells; the only prerequisite
+    feat_shape.compute(s, cache=True)                   # unified pass → {sid}_features_all.parquet
     print(f"[build-features] {sid}: done — run `roi-classifier predict {sid}` next.")
     return 0
 
@@ -257,14 +211,13 @@ def main(argv: list[str] | None = None) -> int:
 
     p_feats = sub.add_parser(
         "build-features",
-        help="Cold-start: build tight-bbox + all 4 feature-group parquets for one subject.",
+        help="Cold-start: build tight-bbox + run the unified feature extractor for one subject.",
     )
     p_feats.add_argument("sid", help="Subject ID (e.g. 790322)")
     p_feats.add_argument("--force", action="store_true",
-                         help="Rebuild the tight-bbox/crops caches even if they exist.")
-    p_feats.add_argument("-j", "--jobs", type=int, default=4,
-                         help="Parallel worker processes for the feature groups "
-                              "(default 4; 1 = serial). bbox is always the serial root.")
+                         help="Rebuild the tight-bbox cache even if it exists.")
+    # Parallelism is controlled by MFISH_FEAT_WORKERS (z-strip cell-chunking inside
+    # the unified pass), not a CLI flag.
 
     p_train = sub.add_parser("train", help="LOSO cross-validation + production model training.")
     p_train.add_argument(

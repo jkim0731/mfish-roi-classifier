@@ -37,15 +37,15 @@ Columns: `hcr_id`, `p_bad`, `p_bad_ok`, `p_good`, `p_merged` (and `human_label` 
 ## Usage
 
 ```bash
-# Cold-start a fresh subject: build the tight-bbox cache + all 4 feature-group
-# parquets (reads the level-2 segmentation_mask_orig_res.zarr), then predict:
+# Cold-start a fresh subject: build the tight-bbox cache, then extract all
+# features in one pass, then predict:
 roi-classifier build-features 790322
 roi-classifier predict 790322
 
-# Just the tight-bbox cache (the cold-start prerequisite the extractors read):
+# Just the tight-bbox cache (the cold-start prerequisite):
 roi-classifier build-bbox 790322          # --force to rebuild
 
-# Run inference when the feature parquets already exist:
+# Run inference when the feature parquet already exists:
 MFISH_DATA_ROOT=/data roi-classifier predict 790322
 
 # Train production models (LOSO cross-validation):
@@ -57,45 +57,44 @@ roi-classifier train --label-log /path/to/roi_qc_actions.jsonl 790322 788406
 
 ### Cold-start data flow
 
-`predict` only **reads** the per-group feature parquets; it does not build them.
-For a subject with nothing cached, run `build-features` first. That chain is:
+`predict` only **reads** the cached feature parquet; `build-features` creates it.
+For a subject with nothing cached:
 
 ```
-build-bbox      → {sid}_hcr_cell_tight_bbox_v1.parquet     (MFISH_TIGHT_BBOX_DIR)
-  ↓ (read by the crops builder + shape/axis extractors)
-build-crops     → {sid}_per_cell_crops.parquet             (MFISH_PER_CELL_CROPS_DIR)
-  ↓ (read by the surface/v4 + protrusion/v5 extractors)
-build-features  → {sid}_features_{v2,v3_extra,v4,v5}.parquet   (MFISH_ROI_QUALITY_DIR)
-  ↓ (merged + scored)
-predict         → {sid}_stage2_4class_proba_v5d_um.parquet     (contract output)
+build-bbox      → {sid}_hcr_cell_tight_bbox_v1.parquet   (MFISH_TIGHT_BBOX_DIR)
+  ↓ (locates each cell)
+build-features  → {sid}_features_all.parquet             (MFISH_ROI_QUALITY_DIR)
+  ↓ (scored)
+predict         → {sid}_stage2_4class_proba_v5d_um.parquet   (contract output)
 ```
 
-`build-features` runs the whole chain (bbox → crops → 4 feature groups). The
-tight-bbox and crops caches are in the **level-2 voxel frame** (the `orig_res`
-zarr the extractors index), per-subject, and read only during cold feature
-extraction; once the feature parquets exist they are never read again.
+`build-features` is a **single unified pass**: per cell it computes the mask,
+opening, and 405 crop once and derives all feature families (shape, axis, surface,
+protrusion, intensity, adjacency) from them, writing one `{sid}_features_all.parquet`
+(no separate per-group or per-cell-crop caches). The tight-bbox cache is in the
+**level-2 voxel frame** (the `orig_res` zarr the extractor indexes) and is read
+only during extraction.
 
-> The shape/v2 extractor optionally reads a `{sid}_stage1_score.parquet` for its
+> The extractor optionally reads a `{sid}_stage1_score.parquet` for its
 > neighbour-adjacency features; if absent those columns are NaN (LightGBM handles
-> NaN), so cold-start still completes — it is not a hard prerequisite.
+> NaN), so cold-start still completes — not a hard prerequisite.
 
 ### Parallel extraction
 
-The shape (v2) and axis (v3) extractors parallelize their z-strip scan across
-cores via `MFISH_FEAT_WORKERS` (default `cpu-2`). The fastest run axis when you
-have a few subjects is **serialize subjects, parallelize within each** — run
-`build-features` with `-j 1` (serial feature groups) and let each group's z-strips
-use all the cores:
+The unified extractor parallelizes across cores by splitting each z-strip's cells
+into spatially-contiguous chunks, via `MFISH_FEAT_WORKERS` (default `cpu-2`):
 
 ```bash
 for sid in 790322 782149 767022; do
-  MFISH_FEAT_WORKERS=14 roi-classifier build-features "$sid" -j 1
+  MFISH_FEAT_WORKERS=14 roi-classifier build-features "$sid"
 done
 ```
 
-Do **not** combine a high `-j` (parallel feature groups) with a high
-`MFISH_FEAT_WORKERS` (parallel strips) — the nested process pools over-subscribe
-the CPU. Feature values are identical to the serial path (verified exact).
+Feature values are **identical to the serial path** (verified exact). Extraction
+is largely memory-bandwidth-bound, so the speedup is sub-linear in worker count.
+`STRIP_Z` is fixed at 128 (the value the model's features were built with);
+overriding `MFISH_STRIP_Z` lower can skip boundary cells unless `Z_PAD` is raised,
+so leave it at the default.
 
 ## Python API
 
@@ -109,3 +108,67 @@ df = predict_subject("790322")
 Lower-level entry points live in the same module: `predict(features_df)` returns
 `(binary_score, four_class_proba)`, and `train(...)` runs the LOSO + production
 training. Feature extraction is `from roi_classifier.features import extract_features`.
+
+## Features
+
+The classifier scores each segmented HCR cell into four classes — **good**,
+**bad_ok**, **bad**, **merged** — plus a binary keep score (positive = `good ∪
+bad_ok`, which is what the coregistration matcher keeps). It uses **91 features**
+in physical (µm) units, extracted per cell from the level-2 segmentation mask and
+the **405 nm channel (Rn28S — cytoplasmic ribosomal RNA, *not* a nuclear/DAPI
+stain)**, scaled by the per-subject voxel pitch. There are **no** within-subject
+percentile-rank features (those are sensitive to sample-prep shifts such as tissue
+thickness). Most features are computed on both the **raw** mask and an **opened**
+mask (a 3-voxel binary opening that strips thin processes). All families are
+computed in a **single unified pass** (each cell's mask + 405 crop is read once);
+they are grouped below by what they measure:
+
+### Shape & size
+- **Size:** `volume_vox_*`, `volume_um3_*`, `bbox_{z,y,x}_extent_um`,
+  `equivalent_diameter_um_*`, `surface_area_um2_*`.
+- **Form / compactness:** `solidity_*` (volume ÷ convex-hull volume), `sphericity_*`,
+  `sa_to_vol_um_inv_*` (surface-to-volume, µm⁻¹), `bbox_occupancy_raw`,
+  `aspect_{zy,zx,yx}` (bbox axis ratios).
+- **Opening robustness:** `frac_kept_opening` — fraction of voxels surviving the
+  opening; low for spiky/fragmentary objects.
+
+### Axis profile & 2-D projections
+Catches over-merged doublets via the intensity/area profile along the cell's
+principal axis and on its three max-projections (xy/yz/zx):
+- **3-D spread:** `axis3d_lambda{1,2,3}_um2` (PCA eigenvalues),
+  `axis3d_lambda_ratio_*`, `axis3d_extent_um`.
+- **Waist / bimodality:** `axis3d_peak_prom_*`, `axis3d_*_min_over_max_*`,
+  `axis3d_section_min_over_*_area` — a deep mid-axis dip ⇒ two fused bodies.
+- **Projections:** `proj_{xy,yz,zx}_main_extent_um`, `proj_*_orth_fwhm_um`,
+  `proj_*_aspect_ratio`, `proj_*_peak_prom_max`, `proj_*_min_over_max_inner`.
+
+### 405 (Rn28S) intensity
+A real cell shows Rn28S filling its cytoplasm; junk/off-tissue ROIs do not.
+- **Level / spread:** `c405_raw_*`, `c405_opened_*` (mean, std, p10/p50/p90).
+- **Core vs shell:** `c405_core_p50_opened`, `c405_shell_p50_opened`, and the
+  calibrated 4-µm versions `c405_core4um_p50_opened`, `c405_shell4um_p50_opened`,
+  `c405_shell_minus_core4um_*`, `c405_shell_over_core4um_p50_ratio`,
+  `core4um_voxel_frac_opened` — uniform fill vs rim-only/empty interior.
+- **Inside vs outside:** `c405_outside_p50`, `c405_inside_minus_outside_p{50,90}`
+  — contrast against the immediate surround.
+
+### Adjacency & local density
+- **Touching:** `n_touching_neighbors`, `surface_touching_frac` (rim fraction
+  abutting any other ROI), `top_neighbor_overlap_frac`, and the touched
+  neighbours' stage-1 quality (`mean/min_touching_score_stage1`).
+- **Density:** `knn_d1` (nearest-neighbour distance, µm), `n_neighbors_30um`
+  (count of other cells within 30 µm).
+
+### Protrusions
+Thin spurs that often signal an over-merge or segmentation bleed:
+`n_protrusion_voxels`, `protrusion_voxel_frac`, `protrusion_rim_voxels`,
+`protrusion_rim_{other,bg}_frac`, `protrusion_top_neighbor_frac`,
+`n_distinct_neighbor_ids_at_protrusion`, `protrusion_into_neighbor_frac` (whether
+the protrusion points into a neighbouring cell — i.e., bleed-over).
+
+> **Unit choice (µm vs voxel).** Production uses the **µm** feature set (the
+> `_v5d_um` model). An A/B against a voxel-unit variant was essentially tied on
+> accuracy; µm won the tiebreaker because the µm features are produced directly by
+> the extractors, whereas the voxel variant needed a separate, costly extraction
+> pass. Within-subject percentile-rank features were excluded (sample-prep
+> sensitivity).

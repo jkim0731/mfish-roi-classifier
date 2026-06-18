@@ -35,71 +35,41 @@ from .model import FEATURE_COLUMNS  # noqa: F401 — re-export for convenience
 _CACHE_DIR = _cfg.ROI_QUALITY_DIR
 
 
-def _read_group_parquet(sid: str, suffix: str) -> pd.DataFrame:
-    """Read a per-group parquet from ROI_QUALITY_DIR; raise if missing."""
-    p = _CACHE_DIR / f"{sid}_features_{suffix}.parquet"
-    if not p.exists():
-        raise FileNotFoundError(
-            f"[{sid}] group parquet missing: {p}\n"
-            f"Run the corresponding feat_* module to generate it, or point "
-            f"MFISH_ROI_QUALITY_DIR at a directory that contains it."
-        )
-    return pd.read_parquet(p)
-
-
 def extract_features(sid: str, cache: bool = True) -> pd.DataFrame:
-    """Merge the four cached per-group parquets and return the 91-col _um feature matrix.
+    """Return the 91-column µm feature matrix for one subject.
+
+    A single unified extractor (`feat_shape.compute`) computes all feature
+    families in one z-strip pass — each cell's mask, opening, and 405 crop are
+    computed once and fed to the shape/axis/surface/protrusion math — and writes
+    one parquet, ``{sid}_features_all.parquet``.
 
     Parameters
     ----------
     sid   : subject ID string (e.g. "790322").
-    cache : if True (default), reads from the per-group parquets already on
-            disk.  Pass cache=False only if you need to force re-extraction via
-            the feat_* modules; the merged frame is never persisted by this
-            function.
+    cache : if True (default), read the cached ``{sid}_features_all.parquet``.
+            If False, run the extractor now (does not write).
 
     Returns
     -------
     DataFrame with columns ``["hcr_id"] + FEATURE_COLUMNS`` (92 total).
-    Row count equals the number of ROIs for the subject.
-
-    Raises
-    ------
-    FileNotFoundError  if a required per-group parquet is absent.
-    ValueError         if a required feature column is missing after merge.
     """
-    if not cache:
-        from .benchmark_data_loader import load_subject
-        from . import feat_shape, feat_axis, feat_surface, feat_protrusion
-        s = load_subject(sid)
-        f = feat_shape.compute(s, cache=False)
-        g = feat_axis.compute(s, cache=False)
-        h = feat_surface.compute(s, cache=False)
-        k = feat_protrusion.compute(s, cache=False)
-    else:
-        f = _read_group_parquet(sid, "v2")
-        g = _read_group_parquet(sid, "v3_extra")
-        h = _read_group_parquet(sid, "v4")
-        k = _read_group_parquet(sid, "v5")
-
-    n_ref = len(f)
-    for name, df in [("v3_extra", g), ("v4", h), ("v5", k)]:
-        if len(df) != n_ref:
-            print(
-                f"  [{sid}] WARNING: {name} has {len(df)} rows vs v2 {n_ref} rows — "
-                f"merge will be on hcr_id (left join)"
+    if cache:
+        p = _CACHE_DIR / f"{sid}_features_all.parquet"
+        if not p.exists():
+            raise FileNotFoundError(
+                f"[{sid}] feature parquet missing: {p}\n"
+                f"Build it with `roi-classifier build-features {sid}` (or point "
+                f"MFISH_ROI_QUALITY_DIR at a directory that contains it)."
             )
+        out = pd.read_parquet(p)
+    else:
+        from .benchmark_data_loader import load_subject
+        from . import feat_shape
+        out = feat_shape.compute(load_subject(sid), cache=False)
 
-    # v4 also contains volume_um3_raw; the _v4 suffix produces
-    # volume_um3_raw_v4, which is one of the 91 _um model features.
-    out = f.merge(g, on="hcr_id", how="left", suffixes=("", "_v3"))
-    out = out.merge(h, on="hcr_id", how="left", suffixes=("", "_v4"))
-    out = out.merge(k, on="hcr_id", how="left", suffixes=("", "_v5d"))
-
-    # Validate that all 91 _um feature columns are present.
     missing = [c for c in FEATURE_COLUMNS if c not in out.columns]
     if missing:
-        raise ValueError(f"[{sid}] missing feature columns after merge: {missing}")
+        raise ValueError(f"[{sid}] missing feature columns: {missing}")
 
     out = out[["hcr_id"] + FEATURE_COLUMNS].copy()
 

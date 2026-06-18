@@ -78,6 +78,12 @@ from tqdm import tqdm
 warnings.filterwarnings("ignore", category=UserWarning, module="zarr")
 
 from .benchmark_data_loader import SubjectData, load_subject
+# Family feature math (leaf modules) — used by the unified single-pass extractor
+# so each cell's mask/opening/405 crop is computed ONCE for all families.
+from . import roi_v3_axis_features, roi_v4_features, roi_v5_features
+from .roi_v3_axis_features import all_v3_axis_features
+from .roi_v4_features import all_v4_features
+from .roi_v5_features import protrusion_features
 from . import config as _cfg
 
 
@@ -99,7 +105,13 @@ EROSION_CORE_RADIUS = 1       # erosion of opened mask -> core
 RIM_RADIUS = 1                # dilation of raw mask -> rim used for adjacency
                               # and inside-vs-outside intensity contrast
 
-STRIP_Z = 128
+import os as _os
+# z-strip height (default 128). NOTE: NOT freely tunable — lowering it puts more
+# cells near strip boundaries, where cells with large z-extent overflow the
+# smaller loaded block (z = STRIP_Z + 2·Z_PAD) and get skipped → different
+# (NaN) features. Changing it requires raising Z_PAD accordingly to stay exact.
+# The production value is 128 (what the _v5d_um model's features were built with).
+STRIP_Z = int(_os.environ.get("MFISH_STRIP_Z", "128"))
 Z_PAD = 24                    # half-context above/below each strip;
                               # must satisfy Z_PAD >= max half-z-extent + OPENING_RADIUS
 
@@ -135,7 +147,8 @@ def _ch405_l2(s: SubjectData):
 
 
 def _features_v2_cache_path(sid: str) -> Path:
-    return ROI_QUALITY_CACHE / f"{sid}_features_v2.parquet"
+    # Unified single-pass output: all 91-feature families in one parquet.
+    return ROI_QUALITY_CACHE / f"{sid}_features_all.parquet"
 
 
 def _meta_v2_path(sid: str) -> Path:
@@ -321,34 +334,38 @@ def _v2_worker_init(sid, ctx_light):
     _V2CTX["has_405"] = _V2CTX["arr405"] is not None
 
 
-def _process_strip_v2(z0_inner):
-    """Process one z-strip; returns (rows, n_owned, n_oversized, n_missing)."""
+def _process_strip_v2(task):
+    """Process one (strip, cell-chunk) task; returns (rows, n_owned, n_oversized, n_missing)."""
+    z0_inner, owned = task
     C = _V2CTX
     seg_orig = C["seg_orig"]; arr405 = C["arr405"]; has_405 = C["has_405"]
     Z_seg = C["Z_seg"]; Y_seg = C["Y_seg"]; X_seg = C["X_seg"]
     seg_z_um = C["seg_z_um"]; seg_xy_um = C["seg_xy_um"]
     tb_lookup = C["tb_lookup"]; cent_z = C["cent_z"]; stage1 = C["stage1"]
-    cells_per_strip = C["cells_per_strip"]; z_hi_global = C["z_hi_global"]
+    z_hi_global = C["z_hi_global"]
     n_owned = 0
     n_oversized = 0
     n_missing_in_zarr = 0
     feature_rows: List[Dict] = []
-    z1_inner = min(z0_inner + STRIP_Z, z_hi_global)
-    z0_load = max(0, z0_inner - Z_PAD)
-    z1_load = min(Z_seg, z1_inner + Z_PAD)
 
-    # Determine which y/x sub-region we actually need to load: union of all
-    # owned cells' bboxes ± pad. This avoids loading the full Y×X plane
-    # when the cells in this strip occupy only part of it.
-    owned = cells_per_strip[z0_inner]
+    # Adaptive per-chunk 3-D bbox: load exactly the z/y/x sub-region this chunk's
+    # cells span (± pad), on ALL THREE axes. Because every cell's padded crop is
+    # contained in the chunk's bbox-union + pad by construction, no cell can
+    # overflow the loaded block → ZERO boundary skips (the old fixed strip ± Z_PAD
+    # z-window is gone). z-strip bucketing is kept only to group z-nearby cells so
+    # the block stays compact; it no longer bounds what is loaded.
     own_bbs = [tb_lookup.get(h) for h in owned if h in tb_lookup]
     if not own_bbs:
         return feature_rows, n_owned, n_oversized, n_missing_in_zarr
+    pad = OPENING_RADIUS + 1
+    z_min = min(b[0] for b in own_bbs)
+    z_max = max(b[1] for b in own_bbs)
     y_min = min(b[2] for b in own_bbs)
     y_max = max(b[3] for b in own_bbs)
     x_min = min(b[4] for b in own_bbs)
     x_max = max(b[5] for b in own_bbs)
-    pad = OPENING_RADIUS + 1
+    z0_load = max(0, z_min - pad)
+    z1_load = min(Z_seg, z_max + pad)
     sub_y0 = max(0, y_min - pad)
     sub_y1 = min(Y_seg, y_max + pad)
     sub_x0 = max(0, x_min - pad)
@@ -455,6 +472,7 @@ def _process_strip_v2(z0_inner):
         else:
             px_raw = px_opened = px_core = px_shell = np.array([], dtype=np.float32)
             img_pad = None
+            img_tight = None
 
         i_raw = _intensity_stats(px_raw)
         i_opened = _intensity_stats(px_opened)
@@ -569,6 +587,23 @@ def _process_strip_v2(z0_inner):
             "mean_touching_score_stage1": mean_score,
             "min_touching_score_stage1": min_score,
         }
+        # ── unified pass: compute axis (v3) + surface (v4) + protrusion (v5)
+        #    families from the SAME raw/opened mask + 405 crop computed above
+        #    (no re-read of the volume, no re-opening).
+        row.update(all_v3_axis_features(
+            mask_raw_tight, mask_opened_tight, img_tight,
+            seg_z_um, seg_xy_um, seg_xy_um, bin_um=1.0, compute_dropped_peaks=False,
+        ))
+        _fv4 = all_v4_features(
+            mask_raw_tight, mask_opened_tight, img_tight,
+            seg_z_um, seg_xy_um, seg_xy_um, r_core_um=4.0,
+        )
+        # v2 + v4 both emit volume_um3_raw; keep v4's as *_v4 (matches the old
+        # 4-parquet merge-suffix the _v5d_um model was trained on).
+        if "volume_um3_raw" in _fv4:
+            _fv4["volume_um3_raw_v4"] = _fv4.pop("volume_um3_raw")
+        row.update(_fv4)
+        row.update(protrusion_features(mask_crop, mask_opened, seg_crop, hid))
         feature_rows.append(row)
     return feature_rows, n_owned, n_oversized, n_missing_in_zarr
 
@@ -668,28 +703,42 @@ def extract_roi_features_v2(
     n_owned = 0
     n_oversized = 0
     n_missing_in_zarr = 0
-    z_strips = sorted(cells_per_strip.keys())
+    import math as _math
     _ctx_light = dict(
         Z_seg=Z_seg, Y_seg=Y_seg, X_seg=X_seg,
         seg_z_um=seg_z_um, seg_xy_um=seg_xy_um,
         tb_lookup=tb_lookup, cent_z=cent_z, stage1=stage1,
-        cells_per_strip=cells_per_strip, z_hi_global=z_hi_global,
+        z_hi_global=z_hi_global,
     )
-    workers = _feat_workers(len(z_strips))
-    print(f"  [{sid}] v2 z-strips={len(z_strips)} workers={workers}")
+    # Balanced parallel units: split each strip's cells into spatially-contiguous
+    # chunks (sorted by ymin) so a dense strip spreads across workers while each
+    # chunk's bbox stays compact (small block load). The strip z-context
+    # (z0..z1 ± Z_PAD) is unchanged, so per-cell features are identical → exact.
+    _total = sum(len(v) for v in cells_per_strip.values())
+    _w = _feat_workers(max(1, _total))
+    _chunk = max(200, _math.ceil(_total / (_w * 3))) if _total else 1
+    tasks = []
+    for _z0 in sorted(cells_per_strip.keys()):
+        _cells = sorted(cells_per_strip[_z0],
+                        key=lambda h: tb_lookup[h][2] if h in tb_lookup else 0)
+        for _i in range(0, len(_cells), _chunk):
+            tasks.append((_z0, _cells[_i:_i + _chunk]))
+    workers = _feat_workers(max(1, len(tasks)))
+    print(f"  [{sid}] v2 strips={len(cells_per_strip)} chunks={len(tasks)} "
+          f"(~{_chunk} cells/chunk) workers={workers}")
     if workers <= 1:
         _V2CTX.clear(); _V2CTX.update(_ctx_light)
         _V2CTX["seg_orig"] = seg_orig
         _V2CTX["arr405"] = arr405
         _V2CTX["has_405"] = has_405
-        results = [_process_strip_v2(z0) for z0 in z_strips]
+        results = [_process_strip_v2(t) for t in tasks]
     else:
         from concurrent.futures import ProcessPoolExecutor
         from multiprocessing import get_context
         with ProcessPoolExecutor(max_workers=workers, mp_context=get_context("spawn"),
                                  initializer=_v2_worker_init,
                                  initargs=(sid, _ctx_light)) as _ex:
-            results = list(_ex.map(_process_strip_v2, z_strips))
+            results = list(_ex.map(_process_strip_v2, tasks))
     for _rows, _no, _nov, _nm in results:
         feature_rows.extend(_rows)
         n_owned += _no
@@ -717,6 +766,14 @@ def extract_roi_features_v2(
         ]
     }
     nan_template["n_touching_neighbors"] = 0
+    # unified families: match each old extractor's nan-fill convention
+    for _c in roi_v3_axis_features.feature_columns():       # v3: n_peaks→0 (unless dropped)
+        nan_template[_c] = (0 if ("n_peaks" in _c and _c not in roi_v3_axis_features._DROPPED_PEAK_COLS)
+                            else float("nan"))
+    for _c in roi_v4_features.feature_columns():            # v4: all NaN (volume_um3_raw→_v4)
+        nan_template["volume_um3_raw_v4" if _c == "volume_um3_raw" else _c] = float("nan")
+    for _c in roi_v5_features.feature_columns():            # v5: all NaN
+        nan_template[_c] = float("nan")
 
     seen_set = {int(r["hcr_id"]) for r in feature_rows}
     for hid in all_hids:
