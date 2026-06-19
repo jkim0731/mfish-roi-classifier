@@ -38,7 +38,6 @@ from . import config as _cfg
 CACHE_DIR = _cfg.ROI_QUALITY_DIR
 
 # Model files shipped inside models/ (version-agnostic names; lineage in meta).
-MODEL_BINARY = _cfg.MODELS_DIR / "roi_quality_binary.txt"
 MODEL_FOUR_CLASS = _cfg.MODELS_DIR / "roi_quality_4class.txt"
 META_JSON = _cfg.MODELS_DIR / "roi_quality_meta.json"
 
@@ -84,21 +83,8 @@ PCT_RANK_COLS: list[str] = []
 # It only affects reporting (a warning + a meta list), never the pooled metric or training.
 LOSO_MIN_EVAL = 20
 
-# LightGBM hyper-parameters (identical to 05h trainer)
-LGB_BINARY = dict(
-    objective="binary",
-    learning_rate=0.05,
-    num_leaves=31,
-    min_data_in_leaf=20,
-    feature_fraction=0.85,
-    bagging_fraction=0.85,
-    bagging_freq=5,
-    lambda_l2=1.0,
-    is_unbalance=True,
-    metric=["binary_logloss", "auc"],
-    verbosity=-1,
-    seed=20260430,
-)
+# LightGBM hyper-parameters. Only the 4-class model is trained; the binary keep-score
+# is its derived marginal P(good)+P(bad_ok), so there is no separate binary config.
 LGB_MULTI = dict(
     objective="multiclass",
     num_class=len(CLASS_NAMES),
@@ -125,25 +111,24 @@ def predict(
     features_df: pd.DataFrame,
     model_dir: Path = _cfg.MODELS_DIR,
 ) -> tuple[pd.Series, pd.DataFrame]:
-    """Run both production models on a pre-built feature matrix.
+    """Run the production 4-class model; the binary keep-score is its marginal.
 
     Parameters
     ----------
     features_df : DataFrame containing at least FEATURE_COLUMNS (and hcr_id).
-    model_dir   : directory containing the .txt model files.
+    model_dir   : directory containing roi_quality_4class.txt.
 
     Returns
     -------
-    binary_score : pd.Series indexed by hcr_id, float in [0, 1] (positive = good/bad_ok).
+    binary_score : pd.Series indexed by hcr_id, float in [0, 1]; the keep probability
+                   P(good) + P(bad_ok) marginalised from the 4-class model (there is no
+                   separate binary model).
     four_class_proba : pd.DataFrame[hcr_id, bad, bad_ok, good, merged].
     """
-    bin_path   = model_dir / "roi_quality_binary.txt"
     multi_path = model_dir / "roi_quality_4class.txt"
-    for p in (bin_path, multi_path):
-        if not p.exists():
-            raise FileNotFoundError(f"model file missing: {p}")
+    if not multi_path.exists():
+        raise FileNotFoundError(f"model file missing: {multi_path}")
 
-    bst_bin   = lgb.Booster(model_file=str(bin_path))
     bst_multi = lgb.Booster(model_file=str(multi_path))
 
     X = features_df[FEATURE_COLUMNS].copy()
@@ -153,13 +138,16 @@ def predict(
 
     hcr_ids = features_df["hcr_id"].to_numpy("int64")
 
-    scores = bst_bin.predict(X, num_iteration=bst_bin.best_iteration)
-    binary_score = pd.Series(scores, index=hcr_ids, name="binary_score")
-    binary_score.index.name = "hcr_id"
-
     proba = bst_multi.predict(X, num_iteration=bst_multi.best_iteration)
     four_class_proba = pd.DataFrame(proba, columns=CLASS_NAMES)
     four_class_proba.insert(0, "hcr_id", hcr_ids)
+
+    # binary keep-score = 4-class marginal P(good) + P(bad_ok); no separate model.
+    binary_score = pd.Series(
+        (four_class_proba["good"] + four_class_proba["bad_ok"]).to_numpy(),
+        index=hcr_ids, name="binary_score",
+    )
+    binary_score.index.name = "hcr_id"
 
     return binary_score, four_class_proba
 
@@ -266,18 +254,6 @@ def _early_stop_split(n: int, frac: float = 0.15, seed: int = 0):
     return idx[:cut], idx[cut:]
 
 
-def _train_binary(X_tr: pd.DataFrame, y_tr: np.ndarray) -> lgb.Booster:
-    tr, va = _early_stop_split(len(X_tr), frac=0.15, seed=42)
-    train_set = lgb.Dataset(X_tr.iloc[tr], y_tr[tr])
-    valid_set = lgb.Dataset(X_tr.iloc[va], y_tr[va], reference=train_set)
-    return lgb.train(
-        LGB_BINARY, train_set,
-        num_boost_round=N_ESTIMATORS,
-        valid_sets=[valid_set],
-        callbacks=[lgb.early_stopping(EARLY_STOP), lgb.log_evaluation(0)],
-    )
-
-
 def _train_multi(X_tr: pd.DataFrame, y_tr: np.ndarray) -> lgb.Booster:
     tr, va = _early_stop_split(len(X_tr), frac=0.15, seed=42)
     train_set = lgb.Dataset(X_tr.iloc[tr], y_tr[tr])
@@ -304,11 +280,9 @@ def train(
     embedded features here so no extraction / attached HCR data is needed.
 
     Writes to out_dir:
-        roi_quality_binary.txt
-        roi_quality_4class.txt
+        roi_quality_4class.txt                (the only model; binary keep is derived)
         roi_quality_meta.json
-        {sid}_roi_quality_binary_oof.parquet  (per-subject OOF)
-        {sid}_roi_quality_4class_oof.parquet  (per-subject OOF)
+        {sid}_roi_quality_4class_oof.parquet  (per-subject OOF; incl. derived binary_score)
 
     Returns the meta dict.
     """
@@ -328,106 +302,17 @@ def train(
             f"{k}={c.get(k, 0)}" for k in ["good", "bad", "bad_ok", "merged", "unsure"]
         ))
 
-    # ── BINARY LOSO ──────────────────────────────────────────────────────────
-    print("\n" + "=" * 62 + "\nBINARY\n" + "=" * 62)
-    bin_metrics: list[dict] = []
-    oof_y_bin, oof_p_bin = [], []   # pooled out-of-fold (micro) accumulation
-
-    for held in subjects:
-        tr_X, tr_y = [], []
-        for sid in subjects:
-            if sid == held:
-                continue
-            f = feats[sid]; l = labs[sid]
-            l = l[l["label"].isin(BINARY_POS | BINARY_NEG)].copy()
-            l["y"] = l["label"].isin(BINARY_POS).astype("int8")
-            merged = f.merge(l[["hcr_id", "y"]], on="hcr_id", how="inner")
-            tr_X.append(_build_matrix(merged))
-            tr_y.append(merged["y"].to_numpy("int8"))
-        X_tr = pd.concat(tr_X, axis=0).reset_index(drop=True)
-        y_tr = np.concatenate(tr_y)
-
-        f_held  = feats[held]
-        X_held  = _build_matrix(f_held)
-        l_held  = labs[held]
-        l_held  = l_held[l_held["label"].isin(BINARY_POS | BINARY_NEG)].copy()
-        l_held["y"] = l_held["label"].isin(BINARY_POS).astype("int8")
-
-        booster    = _train_binary(X_tr, y_tr)
-        y_pred_all = booster.predict(X_held, num_iteration=booster.best_iteration)
-
-        scored  = pd.DataFrame({"hcr_id": f_held["hcr_id"].to_numpy(), "score": y_pred_all})
-        eval_df = l_held.merge(scored, on="hcr_id", how="left")
-        y_eval  = eval_df["y"].to_numpy("int8")
-        p_eval  = eval_df["score"].to_numpy("float64")
-        oof_y_bin.append(y_eval); oof_p_bin.append(p_eval)   # for the pooled (micro) metric
-
-        auc   = roc_auc_score(y_eval, p_eval) if len(np.unique(y_eval)) > 1 else float("nan")
-        ap    = average_precision_score(y_eval, p_eval) if len(np.unique(y_eval)) > 1 else float("nan")
-        brier = brier_score_loss(y_eval, p_eval)
-        acc   = accuracy_score(y_eval, (p_eval >= 0.5).astype("int8"))
-
-        bin_metrics.append({
-            "held_subject": held,
-            "n_train": int(len(X_tr)),
-            "n_eval": int(len(y_eval)),
-            "auc": auc, "ap": ap, "brier": brier, "acc@0.5": acc,
-            "best_iter": booster.best_iteration,
-            "n_pos_train": int((y_tr == 1).sum()),
-            "n_neg_train": int((y_tr == 0).sum()),
-            "n_pos_eval": int((y_eval == 1).sum()),
-            "n_neg_eval": int((y_eval == 0).sum()),
-        })
-        print(
-            f"[hold {held}] n_tr={len(X_tr):3d} (pos {(y_tr==1).sum()}/neg {(y_tr==0).sum()})  "
-            f"n_ev={len(y_eval):3d}  AUC={auc:.4f}  AP={ap:.4f}  Brier={brier:.4f}  "
-            f"acc@0.5={acc:.3f}  iter={booster.best_iteration}"
-        )
-
-        oof = pd.DataFrame({
-            "hcr_id": f_held["hcr_id"].to_numpy("int64"),
-            "score":  y_pred_all.astype("float32"),
-        }).merge(
-            l_held.rename(columns={"label": "human_label"})[["hcr_id", "human_label"]],
-            on="hcr_id", how="left",
-        )
-        oof.to_parquet(out_dir / f"{held}_roi_quality_binary_oof.parquet", index=False)
-
-    bm = pd.DataFrame(bin_metrics).sort_values("held_subject")
-
-    # Pooled out-of-fold (micro) metric — the HEADLINE. Every held-out prediction goes
-    # into one pool, so the AUC is defined and meaningful even when individual subjects
-    # have a single class or very few labels (robust to uneven per-subject distributions).
-    # The per-subject means below are diagnostics only.
-    pooled_y = np.concatenate(oof_y_bin) if oof_y_bin else np.array([], dtype="int8")
-    pooled_p = np.concatenate(oof_p_bin) if oof_p_bin else np.array([], dtype="float64")
-    _both = len(np.unique(pooled_y)) > 1
-    oof_auc   = roc_auc_score(pooled_y, pooled_p) if _both else float("nan")
-    oof_ap    = average_precision_score(pooled_y, pooled_p) if _both else float("nan")
-    oof_brier = brier_score_loss(pooled_y, pooled_p) if len(pooled_y) else float("nan")
-    oof_acc   = accuracy_score(pooled_y, (pooled_p >= 0.5).astype("int8")) if len(pooled_y) else float("nan")
-
-    nan_auc_subj = bm.loc[bm["auc"].isna(), "held_subject"].tolist()
-    low_n_subj   = bm.loc[bm["n_eval"] < LOSO_MIN_EVAL, "held_subject"].tolist()
-
-    print(f"\nbinary OOF (pooled, micro):  AUC={oof_auc:.4f}  AP={oof_ap:.4f}  "
-          f"Brier={oof_brier:.4f}  acc@0.5={oof_acc:.3f}  (n={len(pooled_y)})")
-    print(f"binary LOSO (per-subject mean, diagnostic):  AUC={bm['auc'].mean():.4f}  "
-          f"AP={bm['ap'].mean():.4f}  Brier={bm['brier'].mean():.4f}  "
-          f"[{int(bm['auc'].notna().sum())}/{len(bm)} folds with defined AUC]")
-    if nan_auc_subj:
-        print(f"  [warn] {len(nan_auc_subj)} subject(s) had single-class eval → per-fold AUC "
-              f"undefined and dropped from the mean (the pooled metric still counts them): "
-              f"{nan_auc_subj}")
-    if low_n_subj:
-        print(f"  [warn] {len(low_n_subj)} subject(s) had < {LOSO_MIN_EVAL} eval labels "
-              f"(noisy per-fold metric): {low_n_subj}")
-
-    # ── 4-CLASS LOSO ─────────────────────────────────────────────────────────
-    print("\n" + "=" * 62 + "\n4-CLASS\n" + "=" * 62)
+    # ── LOSO  (single 4-class model; binary keep-score DERIVED from its marginal) ──
+    # One multiclass model is trained. The binary keep decision (good ∪ bad_ok vs the
+    # rest) is the 4-class marginal P(good)+P(bad_ok): an OOF A/B showed it matches/beats
+    # a separately-trained binary head and removes the two heads' ~8% disagreement.
+    print("\n" + "=" * 62 + "\n4-CLASS  (binary keep = P(good)+P(bad_ok))\n" + "=" * 62)
     multi_metrics: list[dict] = []
+    bin_metrics: list[dict] = []
     overall_cm = np.zeros((len(CLASS_NAMES), len(CLASS_NAMES)), dtype=int)
-    oof_y_mc, oof_pred_mc = [], []   # pooled out-of-fold (micro) accumulation
+    oof_y_mc, oof_pred_mc = [], []   # pooled 4-class (micro)
+    oof_y_bin, oof_p_bin = [], []    # pooled binary keep (derived, micro)
+    keep_idx = [CLASS_TO_IDX["bad_ok"], CLASS_TO_IDX["good"]]   # KEEP = good ∪ bad_ok
 
     for held in subjects:
         tr_X, tr_y = [], []
@@ -480,21 +365,39 @@ def train(
             row[f"n_eval_{c}"]  = int((y_eval == CLASS_TO_IDX[c]).sum())
         multi_metrics.append(row)
 
+        # binary keep-score DERIVED from the 4-class marginal: P(good) + P(bad_ok)
+        y_keep = np.isin(y_eval, keep_idx).astype("int8")
+        p_keep = proba_eval[:, keep_idx].sum(axis=1)
+        oof_y_bin.append(y_keep); oof_p_bin.append(p_keep)
+        _kb = len(np.unique(y_keep)) > 1
+        b_auc   = roc_auc_score(y_keep, p_keep) if _kb else float("nan")
+        b_ap    = average_precision_score(y_keep, p_keep) if _kb else float("nan")
+        b_brier = brier_score_loss(y_keep, p_keep)
+        b_acc   = accuracy_score(y_keep, (p_keep >= 0.5).astype("int8"))
+        bin_metrics.append({
+            "held_subject": held, "n_eval": int(len(y_keep)),
+            "auc": b_auc, "ap": b_ap, "brier": b_brier, "acc@0.5": b_acc,
+            "n_pos_eval": int((y_keep == 1).sum()), "n_neg_eval": int((y_keep == 0).sum()),
+        })
+
         print(
             f"[hold {held}] n_tr={len(X_tr):3d}  n_ev={len(y_eval):3d}  "
-            f"acc={acc:.3f}  f1_macro={f1m:.3f}  "
+            f"acc={acc:.3f}  f1_macro={f1m:.3f}  keepAUC={b_auc:.4f}  "
             + " ".join(f"f1_{c}={f:.2f}" for c, f in zip(CLASS_NAMES, f1p))
         )
 
-        oof = scored[["hcr_id"] + [f"p_{c}" for c in CLASS_NAMES]].merge(
+        oof = scored[["hcr_id"] + [f"p_{c}" for c in CLASS_NAMES]].copy()
+        oof["binary_score"] = scored["p_good"] + scored["p_bad_ok"]   # derived keep-score
+        oof = oof.merge(
             l_held.rename(columns={"label": "human_label"})[["hcr_id", "human_label"]],
             on="hcr_id", how="left",
         )
         oof.to_parquet(out_dir / f"{held}_roi_quality_4class_oof.parquet", index=False)
 
     mm = pd.DataFrame(multi_metrics).sort_values("held_subject")
+    bm = pd.DataFrame(bin_metrics).sort_values("held_subject")
 
-    # Pooled out-of-fold (micro) — headline; per-subject means are diagnostics.
+    # ── pooled out-of-fold (micro) metrics — the HEADLINE for both heads ──
     pooled_y_mc    = np.concatenate(oof_y_mc) if oof_y_mc else np.array([], dtype="int8")
     pooled_pred_mc = np.concatenate(oof_pred_mc) if oof_pred_mc else np.array([], dtype="int64")
     _all_lbl = list(range(len(CLASS_NAMES)))
@@ -502,29 +405,36 @@ def train(
     oof_f1m_mc = (f1_score(pooled_y_mc, pooled_pred_mc, average="macro",
                            labels=_all_lbl, zero_division=0)
                   if len(pooled_y_mc) else float("nan"))
+
+    # binary keep (DERIVED from the 4-class marginal), pooled + per-subject diagnostics
+    pooled_y = np.concatenate(oof_y_bin) if oof_y_bin else np.array([], dtype="int8")
+    pooled_p = np.concatenate(oof_p_bin) if oof_p_bin else np.array([], dtype="float64")
+    _both = len(np.unique(pooled_y)) > 1
+    oof_auc   = roc_auc_score(pooled_y, pooled_p) if _both else float("nan")
+    oof_ap    = average_precision_score(pooled_y, pooled_p) if _both else float("nan")
+    oof_brier = brier_score_loss(pooled_y, pooled_p) if len(pooled_y) else float("nan")
+    oof_acc   = accuracy_score(pooled_y, (pooled_p >= 0.5).astype("int8")) if len(pooled_y) else float("nan")
+    nan_auc_subj = bm.loc[bm["auc"].isna(), "held_subject"].tolist()
+    low_n_subj   = bm.loc[bm["n_eval"] < LOSO_MIN_EVAL, "held_subject"].tolist()
+
     print(f"\n4-class OOF (pooled, micro):  acc={oof_acc_mc:.4f}  f1_macro={oof_f1m_mc:.4f}  "
           f"(n={len(pooled_y_mc)})")
     print(f"4-class LOSO (per-subject mean, diagnostic):  acc={mm['acc'].mean():.4f}  "
           f"f1_macro={mm['f1_macro'].mean():.4f}")
+    print(f"\nbinary keep OOF (derived P(good)+P(bad_ok), pooled micro):  AUC={oof_auc:.4f}  "
+          f"AP={oof_ap:.4f}  Brier={oof_brier:.4f}  acc@0.5={oof_acc:.3f}  (n={len(pooled_y)})")
+    print(f"binary keep LOSO (per-subject mean, diagnostic):  AUC={bm['auc'].mean():.4f}  "
+          f"AP={bm['ap'].mean():.4f}  Brier={bm['brier'].mean():.4f}  "
+          f"[{int(bm['auc'].notna().sum())}/{len(bm)} folds with defined AUC]")
+    if nan_auc_subj:
+        print(f"  [warn] {len(nan_auc_subj)} subject(s) had single-class keep eval → per-fold "
+              f"AUC undefined, dropped from the mean (pooled still counts them): {nan_auc_subj}")
+    if low_n_subj:
+        print(f"  [warn] {len(low_n_subj)} subject(s) had < {LOSO_MIN_EVAL} eval labels "
+              f"(noisy per-fold metric): {low_n_subj}")
 
-    # ── PRODUCTION MODELS ────────────────────────────────────────────────────
-    print("\n" + "=" * 62 + "\nproduction models\n" + "=" * 62)
-
-    Xb_parts, yb_parts = [], []
-    for sid in subjects:
-        f = feats[sid]; l = labs[sid]
-        l = l[l["label"].isin(BINARY_POS | BINARY_NEG)].copy()
-        l["y"] = l["label"].isin(BINARY_POS).astype("int8")
-        m = f.merge(l[["hcr_id", "y"]], on="hcr_id", how="inner")
-        Xb_parts.append(_build_matrix(m)); yb_parts.append(m["y"].to_numpy("int8"))
-    Xb = pd.concat(Xb_parts, axis=0).reset_index(drop=True)
-    yb = np.concatenate(yb_parts)
-    n_iter_b = max(int(np.median([m["best_iter"] for m in bin_metrics])), 80)
-    bin_prod = lgb.train(LGB_BINARY, lgb.Dataset(Xb, yb),
-                         num_boost_round=n_iter_b,
-                         callbacks=[lgb.log_evaluation(0)])
-    bin_prod.save_model(str(out_dir / "roi_quality_binary.txt"))
-    print(f"  binary: {len(Xb)} rows, {n_iter_b} iters")
+    # ── PRODUCTION MODEL (4-class only; binary keep is derived at predict time) ──
+    print("\n" + "=" * 62 + "\nproduction model\n" + "=" * 62)
 
     Xm_parts, ym_parts = [], []
     for sid in subjects:
@@ -540,7 +450,7 @@ def train(
                            num_boost_round=n_iter_m,
                            callbacks=[lgb.log_evaluation(0)])
     multi_prod.save_model(str(out_dir / "roi_quality_4class.txt"))
-    print(f"  4-class: {len(Xm)} rows, {n_iter_m} iters")
+    print(f"  4-class: {len(Xm)} rows, {n_iter_m} iters  (binary keep derived at predict)")
 
     meta: dict = {
         "version": "1",
@@ -550,9 +460,21 @@ def train(
         "binary_pos": sorted(BINARY_POS),
         "binary_neg": sorted(BINARY_NEG),
         "pct_rank_columns": PCT_RANK_COLS,
+        "four_class": {
+            "n_train_total": int(len(Xm)),
+            "n_iter_prod": int(n_iter_m),
+            # headline: pooled out-of-fold (micro)
+            "oof_pooled_acc": float(oof_acc_mc),
+            "oof_pooled_f1_macro": float(oof_f1m_mc),
+            "oof_n_eval": int(len(pooled_y_mc)),
+            # diagnostics: per-subject LOSO means
+            "loso_mean_acc": float(mm["acc"].mean()),
+            "loso_mean_f1_macro": float(mm["f1_macro"].mean()),
+            "params": LGB_MULTI,
+        },
         "binary": {
-            "n_train_total": int(len(Xb)),
-            "n_iter_prod": int(n_iter_b),
+            # DERIVED from the 4-class marginal — there is no separate binary model file.
+            "derived_from": "four_class marginal: P(good) + P(bad_ok)",
             # headline: pooled out-of-fold (micro), robust to per-subject imbalance
             "oof_pooled_auc": float(oof_auc),
             "oof_pooled_ap": float(oof_ap),
@@ -570,19 +492,6 @@ def train(
             "loso_valid_auc_folds": int(bm["auc"].notna().sum()),
             "loso_nan_auc_subjects": nan_auc_subj,
             "loso_low_n_subjects": low_n_subj,
-            "params": LGB_BINARY,
-        },
-        "four_class": {
-            "n_train_total": int(len(Xm)),
-            "n_iter_prod": int(n_iter_m),
-            # headline: pooled out-of-fold (micro)
-            "oof_pooled_acc": float(oof_acc_mc),
-            "oof_pooled_f1_macro": float(oof_f1m_mc),
-            "oof_n_eval": int(len(pooled_y_mc)),
-            # diagnostics: per-subject LOSO means
-            "loso_mean_acc": float(mm["acc"].mean()),
-            "loso_mean_f1_macro": float(mm["f1_macro"].mean()),
-            "params": LGB_MULTI,
         },
     }
     (out_dir / "roi_quality_meta.json").write_text(json.dumps(meta, indent=2))
