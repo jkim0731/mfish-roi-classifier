@@ -48,27 +48,34 @@ CLASS_TO_IDX = {c: i for i, c in enumerate(CLASS_NAMES)}
 BINARY_POS = {"good", "bad_ok"}
 BINARY_NEG = {"bad", "merged"}
 
-# Feature columns — loaded verbatim from the shipped meta JSON so they stay in
-# sync with the trained model without manual transcription. µm shape / surface /
-# axis / protrusion features + a few raw voxel counts + 405 intensity + neighbour-
-# quality aggregates. 405-only; no percentile-rank columns.
+# Feature columns — the model's feature-name contract. µm shape / surface / axis /
+# protrusion features + a few raw voxel counts + 405 intensity + neighbour-quality
+# aggregates. 405-only; no percentile-rank columns.
+#
+# Two sources, depending on the capsule:
+#   * predict / Capsule 1  — read verbatim from the shipped model meta (a model
+#     exists, so its schema is authoritative).
+#   * train_embedded / Capsule 3 — there is no base model; the schema is DERIVED
+#     from the labels themselves (each self-contained label embeds its features by
+#     name) via `_derive_feature_columns`, then installed with `_set_feature_columns`.
+# So the import-time load is tolerant: no meta → empty list (training will fill it).
 def _load_feature_columns() -> list[str]:
     meta_path = META_JSON
     if not meta_path.exists():
-        raise FileNotFoundError(
-            f"model meta JSON not found: {meta_path}\n"
-            f"Point MFISH_MODELS_DIR at the directory containing "
-            f"roi_quality_meta.json."
-        )
+        return []
     with open(meta_path) as _f:
         _meta = json.load(_f)
-    return list(_meta["feature_columns"])
+    return list(_meta.get("feature_columns", []))
 
 FEATURE_COLUMNS: list[str] = _load_feature_columns()
 
-# The feature set is defined entirely by the shipped meta. Guard against gross
-# corruption, not an exact count, so the set can evolve via the meta.
-assert len(FEATURE_COLUMNS) >= 80, f"too few feature columns ({len(FEATURE_COLUMNS)}) — meta corrupt?"
+
+def _set_feature_columns(cols) -> None:
+    """Install the active feature schema (module-global) for this process. Used by
+    `train_embedded` to adopt the schema derived from the labels (design A — the
+    training capsule needs no base model)."""
+    global FEATURE_COLUMNS
+    FEATURE_COLUMNS = list(cols)
 
 # Percentile-rank feature columns: none (kept for meta parity; pct_rank_columns: []).
 PCT_RANK_COLS: list[str] = []
@@ -588,18 +595,67 @@ def _warn_label_provenance(log: pd.DataFrame, subjects: list[str]) -> None:
               f"across events (the newest wins).")
 
 
+def _derive_feature_columns(log: pd.DataFrame, subjects: list[str]) -> list[str]:
+    """Feature schema taken from the labels themselves — design A, so the training
+    capsule needs no base model. STRICT: every feature-bearing label record (across
+    all subjects and all merged label assets) must embed the IDENTICAL set of feature
+    names, else raise. A disagreement means the labels were made with different
+    extractor versions; the fix is to re-extract + re-label, not to train on a mixed
+    set. Order is canonical (sorted) for reproducibility — order is irrelevant to the
+    model (features are selected by name), but a stable order makes the meta diffable.
+    """
+    sub = log[log["sid"].astype(str).isin([str(s) for s in subjects])]
+    sub = sub[sub["label"].isin(_LABELS)]            # real labels (tombstones carry no features)
+    keysets: dict[frozenset, int] = {}
+    feats_ser = sub["features"] if "features" in sub.columns else pd.Series([], dtype=object)
+    for f in feats_ser:
+        if isinstance(f, dict) and f:
+            ks = frozenset(f.keys())
+            keysets[ks] = keysets.get(ks, 0) + 1
+    if not keysets:
+        raise ValueError(
+            "no embedded features found in any label record — cannot derive the feature "
+            "schema. Were the labels back-filled into the self-contained schema?"
+        )
+    if len(keysets) > 1:
+        items = sorted(keysets.items(), key=lambda kv: -kv[1])
+        base = set(items[0][0])
+        lines = ["embedded feature sets DISAGREE across label records — refusing to train on a "
+                 "mixed feature set (re-extract + re-label to unify). Distinct sets found:"]
+        for ks, n in items:
+            extra, missing = sorted(set(ks) - base), sorted(base - set(ks))
+            lines.append(f"  - {len(ks)} features, {n} record(s)"
+                         + (f"; extra={extra}" if extra else "")
+                         + (f"; missing={missing}" if missing else ""))
+        raise ValueError("\n".join(lines))
+    cols = sorted(next(iter(keysets)))
+    print(f"feature schema derived from labels: {len(cols)} features, identical across all "
+          f"{sum(keysets.values())} feature-bearing label record(s).")
+    return cols
+
+
 def train_embedded(
     subjects: list[str],
     label_log_path: Path,
     out_dir: Path = _cfg.MODELS_DIR,
+    feature_columns: list[str] | None = None,
 ) -> dict:
     """LIGHT trainer: build the matrix ONLY from each label's embedded `features`
-    (no feature extraction, no attached HCR/features assets). Warns on conflicting
-    labels and re-labeled ROIs, and skips+warns any label whose embedded features
-    don't cover the current feature set (by name)."""
+    (no feature extraction, no attached HCR/features assets, NO base model).
+
+    The feature schema is DERIVED from the labels (`_derive_feature_columns`, strict
+    same-set check) and installed for this run, then written into the new model's
+    meta. Pass `feature_columns` to override the derivation (e.g. a pinned schema).
+    Warns on conflicting labels and re-labeled ROIs."""
     log = _load_label_log(label_log_path)
     print(f"label log: {len(log)} rows")
     _warn_label_provenance(log, subjects)
+
+    # Self-contained schema: learn the feature set from the labels, then adopt it so
+    # every downstream consumer of FEATURE_COLUMNS (matrix build, meta write) uses it.
+    if feature_columns is None:
+        feature_columns = _derive_feature_columns(log, subjects)
+    _set_feature_columns(feature_columns)
 
     feats: dict = {}
     for sid in subjects:
