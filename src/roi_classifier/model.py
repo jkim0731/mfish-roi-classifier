@@ -80,6 +80,10 @@ def _set_feature_columns(cols) -> None:
 # Percentile-rank feature columns: none (kept for meta parity; pct_rank_columns: []).
 PCT_RANK_COLS: list[str] = []
 
+# Soft threshold for FLAGGING a LOSO fold as sparse in the per-subject diagnostics.
+# It only affects reporting (a warning + a meta list), never the pooled metric or training.
+LOSO_MIN_EVAL = 20
+
 # LightGBM hyper-parameters (identical to 05h trainer)
 LGB_BINARY = dict(
     objective="binary",
@@ -327,6 +331,7 @@ def train(
     # ── BINARY LOSO ──────────────────────────────────────────────────────────
     print("\n" + "=" * 62 + "\nBINARY\n" + "=" * 62)
     bin_metrics: list[dict] = []
+    oof_y_bin, oof_p_bin = [], []   # pooled out-of-fold (micro) accumulation
 
     for held in subjects:
         tr_X, tr_y = [], []
@@ -355,6 +360,7 @@ def train(
         eval_df = l_held.merge(scored, on="hcr_id", how="left")
         y_eval  = eval_df["y"].to_numpy("int8")
         p_eval  = eval_df["score"].to_numpy("float64")
+        oof_y_bin.append(y_eval); oof_p_bin.append(p_eval)   # for the pooled (micro) metric
 
         auc   = roc_auc_score(y_eval, p_eval) if len(np.unique(y_eval)) > 1 else float("nan")
         ap    = average_precision_score(y_eval, p_eval) if len(np.unique(y_eval)) > 1 else float("nan")
@@ -388,13 +394,40 @@ def train(
         oof.to_parquet(out_dir / f"{held}_roi_quality_binary_oof.parquet", index=False)
 
     bm = pd.DataFrame(bin_metrics).sort_values("held_subject")
-    print(f"\nbinary LOSO:  mean AUC={bm['auc'].mean():.4f}  "
-          f"AP={bm['ap'].mean():.4f}  Brier={bm['brier'].mean():.4f}")
+
+    # Pooled out-of-fold (micro) metric — the HEADLINE. Every held-out prediction goes
+    # into one pool, so the AUC is defined and meaningful even when individual subjects
+    # have a single class or very few labels (robust to uneven per-subject distributions).
+    # The per-subject means below are diagnostics only.
+    pooled_y = np.concatenate(oof_y_bin) if oof_y_bin else np.array([], dtype="int8")
+    pooled_p = np.concatenate(oof_p_bin) if oof_p_bin else np.array([], dtype="float64")
+    _both = len(np.unique(pooled_y)) > 1
+    oof_auc   = roc_auc_score(pooled_y, pooled_p) if _both else float("nan")
+    oof_ap    = average_precision_score(pooled_y, pooled_p) if _both else float("nan")
+    oof_brier = brier_score_loss(pooled_y, pooled_p) if len(pooled_y) else float("nan")
+    oof_acc   = accuracy_score(pooled_y, (pooled_p >= 0.5).astype("int8")) if len(pooled_y) else float("nan")
+
+    nan_auc_subj = bm.loc[bm["auc"].isna(), "held_subject"].tolist()
+    low_n_subj   = bm.loc[bm["n_eval"] < LOSO_MIN_EVAL, "held_subject"].tolist()
+
+    print(f"\nbinary OOF (pooled, micro):  AUC={oof_auc:.4f}  AP={oof_ap:.4f}  "
+          f"Brier={oof_brier:.4f}  acc@0.5={oof_acc:.3f}  (n={len(pooled_y)})")
+    print(f"binary LOSO (per-subject mean, diagnostic):  AUC={bm['auc'].mean():.4f}  "
+          f"AP={bm['ap'].mean():.4f}  Brier={bm['brier'].mean():.4f}  "
+          f"[{int(bm['auc'].notna().sum())}/{len(bm)} folds with defined AUC]")
+    if nan_auc_subj:
+        print(f"  [warn] {len(nan_auc_subj)} subject(s) had single-class eval → per-fold AUC "
+              f"undefined and dropped from the mean (the pooled metric still counts them): "
+              f"{nan_auc_subj}")
+    if low_n_subj:
+        print(f"  [warn] {len(low_n_subj)} subject(s) had < {LOSO_MIN_EVAL} eval labels "
+              f"(noisy per-fold metric): {low_n_subj}")
 
     # ── 4-CLASS LOSO ─────────────────────────────────────────────────────────
     print("\n" + "=" * 62 + "\n4-CLASS\n" + "=" * 62)
     multi_metrics: list[dict] = []
     overall_cm = np.zeros((len(CLASS_NAMES), len(CLASS_NAMES)), dtype=int)
+    oof_y_mc, oof_pred_mc = [], []   # pooled out-of-fold (micro) accumulation
 
     for held in subjects:
         tr_X, tr_y = [], []
@@ -425,6 +458,7 @@ def train(
         y_eval  = eval_df["y"].to_numpy("int8")
         proba_eval = eval_df[[f"p_{c}" for c in CLASS_NAMES]].to_numpy("float64")
         y_pred  = proba_eval.argmax(axis=1)
+        oof_y_mc.append(y_eval); oof_pred_mc.append(y_pred)   # for the pooled (micro) metric
         acc     = accuracy_score(y_eval, y_pred)
         f1m     = f1_score(y_eval, y_pred, average="macro", zero_division=0)
         f1p     = f1_score(y_eval, y_pred, average=None,
@@ -459,8 +493,19 @@ def train(
         oof.to_parquet(out_dir / f"{held}_roi_quality_4class_oof.parquet", index=False)
 
     mm = pd.DataFrame(multi_metrics).sort_values("held_subject")
-    print(f"\n4-class LOSO:  mean acc={mm['acc'].mean():.4f}  "
-          f"mean f1_macro={mm['f1_macro'].mean():.4f}")
+
+    # Pooled out-of-fold (micro) — headline; per-subject means are diagnostics.
+    pooled_y_mc    = np.concatenate(oof_y_mc) if oof_y_mc else np.array([], dtype="int8")
+    pooled_pred_mc = np.concatenate(oof_pred_mc) if oof_pred_mc else np.array([], dtype="int64")
+    _all_lbl = list(range(len(CLASS_NAMES)))
+    oof_acc_mc = accuracy_score(pooled_y_mc, pooled_pred_mc) if len(pooled_y_mc) else float("nan")
+    oof_f1m_mc = (f1_score(pooled_y_mc, pooled_pred_mc, average="macro",
+                           labels=_all_lbl, zero_division=0)
+                  if len(pooled_y_mc) else float("nan"))
+    print(f"\n4-class OOF (pooled, micro):  acc={oof_acc_mc:.4f}  f1_macro={oof_f1m_mc:.4f}  "
+          f"(n={len(pooled_y_mc)})")
+    print(f"4-class LOSO (per-subject mean, diagnostic):  acc={mm['acc'].mean():.4f}  "
+          f"f1_macro={mm['f1_macro'].mean():.4f}")
 
     # ── PRODUCTION MODELS ────────────────────────────────────────────────────
     print("\n" + "=" * 62 + "\nproduction models\n" + "=" * 62)
@@ -508,15 +553,33 @@ def train(
         "binary": {
             "n_train_total": int(len(Xb)),
             "n_iter_prod": int(n_iter_b),
+            # headline: pooled out-of-fold (micro), robust to per-subject imbalance
+            "oof_pooled_auc": float(oof_auc),
+            "oof_pooled_ap": float(oof_ap),
+            "oof_pooled_brier": float(oof_brier),
+            "oof_pooled_acc05": float(oof_acc),
+            "oof_n_eval": int(len(pooled_y)),
+            "oof_n_pos": int((pooled_y == 1).sum()),
+            "oof_n_neg": int((pooled_y == 0).sum()),
+            # diagnostics: per-subject LOSO means (fragile under uneven distributions)
             "loso_mean_auc": float(bm["auc"].mean()),
             "loso_mean_ap": float(bm["ap"].mean()),
             "loso_mean_brier": float(bm["brier"].mean()),
             "loso_mean_acc05": float(bm["acc@0.5"].mean()),
+            "loso_n_folds": int(len(bm)),
+            "loso_valid_auc_folds": int(bm["auc"].notna().sum()),
+            "loso_nan_auc_subjects": nan_auc_subj,
+            "loso_low_n_subjects": low_n_subj,
             "params": LGB_BINARY,
         },
         "four_class": {
             "n_train_total": int(len(Xm)),
             "n_iter_prod": int(n_iter_m),
+            # headline: pooled out-of-fold (micro)
+            "oof_pooled_acc": float(oof_acc_mc),
+            "oof_pooled_f1_macro": float(oof_f1m_mc),
+            "oof_n_eval": int(len(pooled_y_mc)),
+            # diagnostics: per-subject LOSO means
             "loso_mean_acc": float(mm["acc"].mean()),
             "loso_mean_f1_macro": float(mm["f1_macro"].mean()),
             "params": LGB_MULTI,
