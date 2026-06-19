@@ -83,7 +83,7 @@ HCR_SEG_XY_DOWNSAMPLE = 4
 @dataclass
 class SubjectData:
     subject_id: str
-    coreg_dir: Path
+    coreg_dir: Path | None   # None when only HCR is attached (classifier-only / no coreg)
     hcr_dir: Path
 
     # resolution in um/pixel for each modality in native pixel space
@@ -117,10 +117,12 @@ class SubjectData:
 # -----------------------------------------------------------
 # path resolution
 # -----------------------------------------------------------
-def _find_coreg_dir(subject_id: str) -> Path:
+def _find_coreg_dir(subject_id: str, required: bool = True) -> Path | None:
     matches = sorted(DATA_DIR.glob(f"{subject_id}*ctl-czstack-hcr-coreg_*"))
     if not matches:
-        raise FileNotFoundError(f"No coreg dir for {subject_id}")
+        if required:
+            raise FileNotFoundError(f"No coreg dir for {subject_id}")
+        return None   # HCR-only mode (e.g. the ROI-quality classifier capsule)
     # Use the most recent one
     return matches[-1]
 
@@ -206,11 +208,11 @@ def _load_cz_centroids(coreg_dir: Path) -> pd.DataFrame:
     return df
 
 
-def _load_hcr_centroids(hcr_dir: Path, coreg_dir: Path) -> pd.DataFrame:
+def _load_hcr_centroids(hcr_dir: Path, coreg_dir: Path | None = None) -> pd.DataFrame:
     """Load HCR cell centroids, preferring the NPY from HCR processed dir.
 
-    For 767018 (older pipeline), use the CSV in the coreg dir.
-    Returns columns [hcr_id, z_px, y_px, x_px].
+    For 767018 (older pipeline), use the CSV in the coreg dir (only when a coreg dir
+    is present). Returns columns [hcr_id, z_px, y_px, x_px].
     """
     npy = hcr_dir / "cell_body_segmentation" / "cell_centroids.npy"
     if npy.exists():
@@ -225,7 +227,7 @@ def _load_hcr_centroids(hcr_dir: Path, coreg_dir: Path) -> pd.DataFrame:
         )
         return df
 
-    csvs = list(coreg_dir.glob("*HCR_cell_centroids.csv"))
+    csvs = list(coreg_dir.glob("*HCR_cell_centroids.csv")) if coreg_dir is not None else []
     if csvs:
         df = pd.read_csv(csvs[0])
         df = df.rename(
@@ -621,7 +623,10 @@ def load_subject(
     that produced it so downstream code can be audited.
     """
     subject_id = str(subject_id)
-    coreg_dir = _find_coreg_dir(subject_id)
+    # Coreg is OPTIONAL: the ROI-quality classifier path uses only HCR (hcr_dir +
+    # hcr_centroids). When no coreg dir is attached we load HCR-only and leave the
+    # coreg-derived fields (cz_centroids, gfp, landmarks, coreg_table) empty.
+    coreg_dir = _find_coreg_dir(subject_id, required=False)
     hcr_dir = _find_hcr_dir(subject_id)
 
     cz_xy, cz_z = _read_cz_resolution(subject_id)
@@ -631,19 +636,30 @@ def load_subject(
     else:
         hcr_xy, hcr_z = hcr_res
 
-    cz = _load_cz_centroids(coreg_dir)
     hcr = _load_hcr_centroids(hcr_dir, coreg_dir)
-    gfp_df, feat, source, effective_min, effective_frac = _load_gfp(
-        subject_id, coreg_dir, hcr_dir,
-        n_hcr_total=len(hcr),
-        gfp_min_spots=gfp_min_spots,
-        gfp_threshold_method=gfp_threshold_method,
-        gfp_target_frac=gfp_target_frac,
-        gfp_intensity_method=gfp_intensity_method,
-    )
-    final_lm, all_lm = _find_final_qced_landmarks(coreg_dir)
-    lm_df = _read_landmark_file(final_lm) if final_lm else pd.DataFrame(columns=LANDMARK_COLS)
-    coreg = _load_coreg_table(coreg_dir)
+    if coreg_dir is not None:
+        cz = _load_cz_centroids(coreg_dir)
+        gfp_df, feat, source, effective_min, effective_frac = _load_gfp(
+            subject_id, coreg_dir, hcr_dir,
+            n_hcr_total=len(hcr),
+            gfp_min_spots=gfp_min_spots,
+            gfp_threshold_method=gfp_threshold_method,
+            gfp_target_frac=gfp_target_frac,
+            gfp_intensity_method=gfp_intensity_method,
+        )
+        final_lm, all_lm = _find_final_qced_landmarks(coreg_dir)
+        lm_df = _read_landmark_file(final_lm) if final_lm else pd.DataFrame(columns=LANDMARK_COLS)
+        coreg = _load_coreg_table(coreg_dir)
+    else:
+        print(f"[load_subject] {subject_id}: no coreg dir found — HCR-only load "
+              f"(classifier feature path needs only HCR; cz/gfp/landmarks/coreg_table left empty).",
+              flush=True)
+        cz = pd.DataFrame()
+        gfp_df, feat, source, effective_min, effective_frac = (
+            pd.DataFrame(), "", "", gfp_min_spots, None)
+        final_lm, all_lm = None, []
+        lm_df = pd.DataFrame(columns=LANDMARK_COLS)
+        coreg = pd.DataFrame()
 
     return SubjectData(
         subject_id=subject_id,
