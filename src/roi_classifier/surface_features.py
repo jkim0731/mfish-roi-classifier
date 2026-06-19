@@ -23,7 +23,7 @@ Surface area is computed on the padded crop using face-counting:
   for each axis, count XOR-flips between adjacent slabs and weight by the
   cross-section voxel-face area in µm².
 
-Inputs to `all_v4_features`:
+Inputs to `compute_surface_features`:
     mask_raw_tight    : bool[Z,Y,X] tight crop (raw seg == hid)
     mask_opened_tight : bool[Z,Y,X] tight crop after binary opening
     img_tight         : uint16[Z,Y,X] c405 in the tight crop  (None → NaN intensities)
@@ -135,7 +135,7 @@ def shape_features(
 
     The µm outputs (surface_area_um2, volume_um3, sa_to_vol_um_inv) were
     previously suppressed by DROP_UM_FEATURES; they are restored here because
-    the production v5d_um model (the um-vs-vox A/B winner) consumes them. See
+    the production model (the um-vs-vox A/B winner) consumes them. See
     docs/13 and the project memory on the um-vs-vox decision.
     """
     sa = surface_area_um2(mask, vz, vy, vx)
@@ -150,7 +150,7 @@ def shape_features(
     }
 
 
-def all_v4_features(
+def compute_surface_features(
     mask_raw_tight: np.ndarray,
     mask_opened_tight: np.ndarray,
     img_tight: Optional[np.ndarray],

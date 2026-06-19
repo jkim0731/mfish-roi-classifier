@@ -133,15 +133,15 @@ def _append_label(record: dict[str, Any]) -> None:
 class _ROI:
     sid: str
     hcr_id: int
-    score: float                                     # v5d stage-2 binary positive prob
+    score: float                                     # binary positive prob
     bbox: tuple[int, int, int, int, int, int]  # zmin, zmax, ymin, ymax, xmin, xmax (level-2 vox)
     centroid: tuple[float, float, float]       # zc, yc, xc (level-2 vox)
     features: dict[str, Any]
     proba_4class: dict[str, float] = field(default_factory=dict)  # keys: bad, bad_ok, good, merged
 
 
-def _load_v5d_proba(sid: str) -> pd.DataFrame:
-    """Per-ROI v5d (_um) scores via the consolidated model + features.
+def _load_quality_proba(sid: str) -> pd.DataFrame:
+    """Per-ROI (_um) scores via the consolidated model + features.
 
     Cols: hcr_id, score (binary positive prob), p_bad, p_bad_ok, p_good, p_merged.
     """
@@ -157,7 +157,7 @@ def _load_v5d_proba(sid: str) -> pd.DataFrame:
     return out[["hcr_id", "score", "p_bad", "p_bad_ok", "p_good", "p_merged"]]
 
 
-def _load_v5d_features(sid: str) -> pd.DataFrame:
+def _load_quality_features(sid: str) -> pd.DataFrame:
     """Per-ROI _um feature matrix (the consolidated production set).
 
     Delegates to the single source of truth `roi_classifier.features`
@@ -171,7 +171,7 @@ def _load_all_features(sid: str) -> pd.DataFrame:
     """All per-ROI features for display + sampling — the consolidated
     _um feature matrix.  (The legacy v1 base parquet and the v2..v6_vox
     + pct-rank stack are no longer used.)"""
-    return _load_v5d_features(sid)
+    return _load_quality_features(sid)
 
 
 # Columns we strip from a merged-parquet row when copying values into
@@ -183,7 +183,7 @@ _RESERVED_ROI_KEYS = frozenset(
         # bbox + centroid (carried as their own _ROI fields)
         "zmin_vox", "zmax_vox", "ymin_vox", "ymax_vox", "xmin_vox", "xmax_vox",
         "zc_vox", "yc_vox", "xc_vox", "volume_vox",
-        # v5d probabilities (carried as `score` and `proba_4class`)
+        # model probabilities (carried as `score` and `proba_4class`)
         "score", "p_bad", "p_bad_ok", "p_good", "p_merged",
     }
 )
@@ -191,9 +191,9 @@ _RESERVED_ROI_KEYS = frozenset(
 
 def _make_roi_from_row(sid: str, r: pd.Series) -> _ROI:
     """Build a `_ROI` from a merged-parquet row that carries feature,
-    bbox, v5d-binary and v5d-4class columns.  All non-reserved numeric
+    bbox, binary and 4-class columns.  All non-reserved numeric
     cells are copied into `features` so downstream code can display
-    any subset (e.g. the live top-N from the v5d model file)."""
+    any subset (e.g. the live top-N from the model file)."""
     features: dict[str, Any] = {}
     for k in r.index:
         if k in _RESERVED_ROI_KEYS:
@@ -230,10 +230,10 @@ def _sample_uncertain(
     skip_hcr_ids: set[int],
 ) -> list[_ROI]:
     feats = _load_all_features(sid)
-    v5d = _load_v5d_proba(sid)
+    quality_proba = _load_quality_proba(sid)
     bbox = pd.read_parquet(TIGHT_BBOX / f"{sid}_hcr_cell_tight_bbox_v1.parquet")
 
-    df = feats.merge(v5d, on="hcr_id").merge(bbox, on="hcr_id", how="inner")
+    df = feats.merge(quality_proba, on="hcr_id").merge(bbox, on="hcr_id", how="inner")
     lo, hi = score_band
     df = df[(df["score"] >= lo) & (df["score"] <= hi)]
     df = df[~df["hcr_id"].isin(skip_hcr_ids)]

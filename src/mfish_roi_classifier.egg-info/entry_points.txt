@@ -1,0 +1,3 @@
+[console_scripts]
+roi-classifier = roi_classifier.cli:main
+roi-classifier-label = roi_classifier.label_gui.app:main

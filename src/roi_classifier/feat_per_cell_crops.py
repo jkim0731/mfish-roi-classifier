@@ -1,4 +1,4 @@
-"""Per-cell padded mask-crop builder for the v5d ROI-quality feature extractors.
+"""Per-cell padded mask-crop builder for the ROI-quality feature extractors.
 
 The surface (v4), protrusion (v5) and neighbour modules **read** a per-cell crops
 parquet (`{sid}_per_cell_crops.parquet` in `MFISH_PER_CELL_CROPS_DIR`) — one
@@ -20,8 +20,7 @@ Public API
 ``build_per_cell_crops(s, cache=True, force=False) -> Path``
 ``build_per_cell_crops_sid(sid, cache=True, force=False) -> Path``
 
-Schema (matches the readers ``feat_surface`` / ``feat_protrusion`` /
-``roi_v5_neighbors``)::
+Schema::
 
     hcr_id int64
     z0_lvl2, y0_lvl2, x0_lvl2 int32   # global lvl2-voxel coords of crop origin

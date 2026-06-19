@@ -340,7 +340,7 @@ def projection_axis_features(
 ) -> Dict[str, float]:
     """Compute 2D-projection axis features on the OPENED mask for xy/yz/zx
     planes (~21 features total).  n_peaks columns in _DROPPED_PEAK_COLS are
-    always NaN (set by the caller, all_v3_axis_features)."""
+    always NaN (set by the caller, compute_axis_features)."""
     out: Dict[str, float] = {}
     if mask_opened_tight.size == 0 or not mask_opened_tight.any():
         for plane in ("xy", "yz", "zx"):
@@ -397,7 +397,7 @@ _DROPPED_PEAK_COLS = frozenset({
 })
 
 
-def all_v3_axis_features(
+def compute_axis_features(
     mask_raw_tight: np.ndarray,
     mask_opened_tight: np.ndarray,
     img_tight: Optional[np.ndarray],

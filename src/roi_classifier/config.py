@@ -4,7 +4,7 @@ All cache/data paths flow through here.  Override at runtime via env vars
 so the package can run against any dataset tree without editing source.
 
 Contract output (consumed by mfish-autocoreg):
-    ROI_QUALITY_DIR / "{sid}_stage2_4class_proba_v5d_um.parquet"
+    ROI_QUALITY_DIR / "{sid}_roi_quality_proba.parquet"
     columns: hcr_id, p_bad, p_bad_ok, p_good, p_merged[, human_label]
 """
 import os

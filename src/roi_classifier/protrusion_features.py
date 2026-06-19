@@ -50,7 +50,7 @@ def _nan_row():
     return {c: float("nan") for c in feature_columns()}
 
 
-def protrusion_features(
+def compute_protrusion_features(
     mask_raw_pad: np.ndarray,
     mask_opened_pad: np.ndarray,
     seg_pad: np.ndarray,

@@ -1,4 +1,4 @@
-"""Per-cell tight-bbox builder for the v5d ROI-quality feature extractors.
+"""Per-cell tight-bbox builder for the ROI-quality feature extractors.
 
 The shape (v2), axis (v3) and surface (v4) feature modules **read** a per-cell
 tight-bbox parquet (`{sid}_hcr_cell_tight_bbox_v1.parquet` in

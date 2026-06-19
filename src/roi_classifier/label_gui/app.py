@@ -72,7 +72,7 @@ from .gui import (
     _load_all_features,
     _load_label_log,
     _load_roi_crops,
-    _load_v5d_proba,
+    _load_quality_proba,
     _make_roi_from_row,
     _planes_for_channel,
     _sample_uncertain,
@@ -98,17 +98,17 @@ _BLINK_SECONDS = 0.15
 # ---------------------------------------------------------------------------
 _PROBA_ORDER = ("bad", "bad_ok", "good", "merged")
 
-# Default v5d production model whose feature-importance ranking drives
+# Default production model whose feature-importance ranking drives
 # the right-hand panel.  We watch its mtime; whenever it changes (e.g.
-# the user reruns `05h_train_stage2_v5d.py`) the panel is rebuilt with
+# the user reruns the trainer) the panel is rebuilt with
 # the new top-N list.
 from .. import config as _cfg  # noqa: E402
-_V5D_4CLASS_MODEL = _cfg.MODELS_DIR / "roi_quality_stage2_4class_v5d_um.txt"
+_QUALITY_4CLASS_MODEL = _cfg.MODELS_DIR / "roi_quality_4class.txt"
 _TOP_FEATURE_N = 10
 
 
 def _predicted_class(proba_4class: dict) -> tuple[str, float]:
-    """Return (class_name, max_proba) from a v5d 4-class proba dict.
+    """Return (class_name, max_proba) from a 4-class proba dict.
 
     Empty dict → ("?", 0.0)."""
     if not proba_4class:
@@ -231,9 +231,9 @@ def _sample_from_candidates(
     if not hcr_ids:
         return []
     feats = _load_all_features(sid)
-    v5d = _load_v5d_proba(sid)
+    quality_proba = _load_quality_proba(sid)
     bbox = pd.read_parquet(TIGHT_BBOX / f"{sid}_hcr_cell_tight_bbox_v1.parquet")
-    df = feats.merge(v5d, on="hcr_id").merge(bbox, on="hcr_id", how="inner")
+    df = feats.merge(quality_proba, on="hcr_id").merge(bbox, on="hcr_id", how="inner")
 
     keep = [h for h in hcr_ids if h not in skip_hcr_ids]
     df = df.set_index("hcr_id")
@@ -255,9 +255,9 @@ def _sample_labelled(
     if not active:
         return [], {}
     feats = _load_all_features(sid)
-    v5d = _load_v5d_proba(sid)
+    quality_proba = _load_quality_proba(sid)
     bbox = pd.read_parquet(TIGHT_BBOX / f"{sid}_hcr_cell_tight_bbox_v1.parquet")
-    df = feats.merge(v5d, on="hcr_id").merge(bbox, on="hcr_id", how="inner")
+    df = feats.merge(quality_proba, on="hcr_id").merge(bbox, on="hcr_id", how="inner")
     df = df[df["hcr_id"].astype(int).isin(active.keys())]
     if df.empty:
         return [], {}
@@ -316,9 +316,9 @@ class StandaloneLabeller:
         self._channel = "405"
         self._mip = False
 
-        # Top-N importance from the v5d 4-class model — the right-hand
+        # Top-N importance from the 4-class model — the right-hand
         # panel re-renders whenever this file's mtime changes.
-        self._top_feats = _TopFeaturesCache(_V5D_4CLASS_MODEL, n=_TOP_FEATURE_N)
+        self._top_feats = _TopFeaturesCache(_QUALITY_4CLASS_MODEL, n=_TOP_FEATURE_N)
 
         # Sampling mode: "new" walks uncertain band (skipping already-labelled);
         # "review" re-walks ROIs that have a current (non-undone) label.
@@ -462,7 +462,7 @@ class StandaloneLabeller:
         self.ax_feat = self.fig.add_axes([0.760, 0.030, 0.230, 0.93])
         self.ax_feat.axis("off")
         self.ax_feat.set_title(
-            f"v5d top-{_TOP_FEATURE_N} (4-class gain)",
+            f"top-{_TOP_FEATURE_N} (4-class gain)",
             fontsize=10, loc="left",
         )
         self.text_feat = self.ax_feat.text(
@@ -579,7 +579,7 @@ class StandaloneLabeller:
         pred_cls, pred_p = _predicted_class(roi.proba_4class)
         return (
             f"sid={roi.sid}   hcr_id={roi.hcr_id}   "
-            f"v5d bin={roi.score:.3f}  pred={pred_cls}({pred_p:.2f})   "
+            f"bin={roi.score:.3f}  pred={pred_cls}({pred_p:.2f})   "
             f"shape (Z×Y×X)={Z}×{Y}×{X}   "
             f"pos (z,y,x)=({self._z_idx},{self._y_idx},{self._x_idx})   "
             f"[{self.idx + 1} / {len(self.rois)}]"
@@ -699,10 +699,10 @@ class StandaloneLabeller:
             "sid": roi.sid,
             "hcr_id": roi.hcr_id,
             "label": label,
-            "binary_score_v5d": roi.score,
-            "proba_v5d": dict(roi.proba_4class),
-            "predicted_class_v5d": pred_cls,
-            "predicted_p_v5d": pred_p,
+            "model_binary_score": roi.score,
+            "model_proba": dict(roi.proba_4class),
+            "model_pred_class": pred_cls,
+            "model_pred_p": pred_p,
             "reviewer": self.reviewer,
             "session_token": self.token,
         }
@@ -741,20 +741,20 @@ class StandaloneLabeller:
     # ---------------------------------------------------------------- features panel
     def _refresh_feature_panel(self, roi: _ROI | None) -> None:
         """Repopulate the right-hand panel with the live top-N gain
-        features from the v5d 4-class model.  Called per ROI and again
+        features from the 4-class model.  Called per ROI and again
         whenever the cache reports the model file changed."""
         top, _ = self._top_feats.get()
         n_used = len(top)
         title = (
-            f"v5d top-{n_used} (4-class gain)"
+            f"top-{n_used} (4-class gain)"
             if n_used > 0
-            else "v5d top features (no model)"
+            else "top features (no model)"
         )
         self.ax_feat.set_title(title, fontsize=10, loc="left")
         if roi is None:
             self.text_feat.set_text("")
             return
-        lines: list[str] = ["v5d (stage-2):"]
+        lines: list[str] = ["model:"]
         pred_cls, pred_p = _predicted_class(roi.proba_4class)
         lines.append(f"  binary score (good|bad_ok)  {roi.score:.3f}")
         lines.append(f"  predicted class             {pred_cls} ({pred_p:.3f})")
@@ -763,7 +763,7 @@ class StandaloneLabeller:
                 lines.append(f"  p_{c:<24s}  {roi.proba_4class[c]:.3f}")
         lines.append("")
         if not top:
-            err = self._top_feats.error or "no v5d 4-class model file"
+            err = self._top_feats.error or "no 4-class model file"
             lines.append(f"top-{_TOP_FEATURE_N} features: ({err})")
         else:
             lines.append(f"top-{n_used} features (gain rank → value):")
@@ -864,7 +864,7 @@ class StandaloneLabeller:
             self._clear_overlay()
             self._draw_overlay(xy_mask, xz_mask, yz_mask)
             self.text_header.set_text(self._format_header())
-            # If the v5d model file was retrained while the GUI is open,
+            # If the model file was retrained while the GUI is open,
             # rebuild the right-hand panel with the new top-N list.
             _, changed = self._top_feats.get()
             if changed:
@@ -1004,16 +1004,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--n-rois", type=int, default=80, help="ROIs to sample per subject")
     p.add_argument("--score-min", type=float, default=0.3,
-                   help="Lower bound of v5d binary-score uncertain band")
+                   help="Lower bound of binary-score uncertain band")
     p.add_argument("--score-max", type=float, default=0.7,
-                   help="Upper bound of v5d binary-score uncertain band")
+                   help="Upper bound of binary-score uncertain band")
     p.add_argument("--reviewer", default="anonymous",
                    help="Reviewer name to record in every label")
     p.add_argument("--seed", type=int, default=20260429,
                    help="RNG seed for reproducible sampling")
     p.add_argument("--candidates", default=None, type=Path,
                    help="CSV with `sid,hcr_id` columns (e.g. "
-                        "outputs/stage2/label_candidates_merged_v2.csv). "
+                        "outputs/label_candidates.csv). "
                         "When set, ROIs are walked in CSV order (top-priority "
                         "first) instead of random uncertain-band sampling. "
                         "Already-labelled rows are still skipped.")

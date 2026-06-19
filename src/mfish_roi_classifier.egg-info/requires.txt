@@ -1,0 +1,16 @@
+numpy
+pandas
+scipy
+scikit-image
+zarr
+lightgbm
+scikit-learn
+pyarrow
+tifffile
+tqdm
+
+[label]
+matplotlib
+ipywidgets
+ipyevents
+IPython

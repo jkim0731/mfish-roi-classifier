@@ -1,4 +1,4 @@
-"""Per-ROI feature extractor v2 for the HCR ROI pass/fail classifier (S11).
+"""Per-ROI feature extractor for the HCR ROI pass/fail classifier (S11).
 
 Redesign (2026-04-30) based on user feedback that v1's channel
 interpretation was wrong:
@@ -35,9 +35,12 @@ Output schema (~42 features, all numeric or bool):
                              c405_inside_minus_outside_p90
   Adjacency                : n_touching_neighbors,
                              surface_touching_frac,
-                             top_neighbor_overlap_frac,
-                             mean_touching_score_stage1,
-                             min_touching_score_stage1
+                             top_neighbor_overlap_frac
+  Neighbour quality        : nbr_{mean,min}_{solidity_opened, sphericity_opened,
+                             bbox_occupancy_raw, frac_kept_opening,
+                             volume_um3_opened, c405_shell_minus_core_p50}
+                             (mean/min over K=6 centroid-NN; self-contained
+                             replacement for the retired stage-1 neighbour scores)
   Spatial                  : knn_d1, n_neighbors_30um
   Sanity                   : tight_bbox_in_pickle_bbox,
                              volume_pickle_minus_zarr_l2_eq
@@ -80,10 +83,10 @@ warnings.filterwarnings("ignore", category=UserWarning, module="zarr")
 from .benchmark_data_loader import SubjectData, load_subject
 # Family feature math (leaf modules) — used by the unified single-pass extractor
 # so each cell's mask/opening/405 crop is computed ONCE for all families.
-from . import roi_v3_axis_features, roi_v4_features, roi_v5_features
-from .roi_v3_axis_features import all_v3_axis_features
-from .roi_v4_features import all_v4_features
-from .roi_v5_features import protrusion_features
+from . import axis_features, surface_features, protrusion_features
+from .axis_features import compute_axis_features
+from .surface_features import compute_surface_features
+from .protrusion_features import compute_protrusion_features
 from . import config as _cfg
 
 
@@ -110,7 +113,7 @@ import os as _os
 # cells near strip boundaries, where cells with large z-extent overflow the
 # smaller loaded block (z = STRIP_Z + 2·Z_PAD) and get skipped → different
 # (NaN) features. Changing it requires raising Z_PAD accordingly to stay exact.
-# The production value is 128 (what the _v5d_um model's features were built with).
+# The production value is 128 (what the production model's features were built with).
 STRIP_Z = int(_os.environ.get("MFISH_STRIP_Z", "128"))
 Z_PAD = 24                    # half-context above/below each strip;
                               # must satisfy Z_PAD >= max half-z-extent + OPENING_RADIUS
@@ -146,17 +149,23 @@ def _ch405_l2(s: SubjectData):
         return None
 
 
-def _features_v2_cache_path(sid: str) -> Path:
+def _features_cache_path(sid: str) -> Path:
     # Unified single-pass output: all 91-feature families in one parquet.
     return ROI_QUALITY_CACHE / f"{sid}_features_all.parquet"
 
 
-def _meta_v2_path(sid: str) -> Path:
-    return ROI_QUALITY_CACHE / f"{sid}_meta_v2.json"
+def _meta_path(sid: str) -> Path:
+    return ROI_QUALITY_CACHE / f"{sid}_features_meta.json"
 
 
-def _stage1_score_path(sid: str) -> Path:
-    return ROI_QUALITY_CACHE / f"{sid}_stage1_score.parquet"
+# Neighbour-quality feature config: the self-contained replacement for the
+# stage-1 neighbour-score pair. For each cell we aggregate the "realness"
+# features of its K nearest neighbours (by centroid, µm) as mean + min.
+_NBR_QFEATS = [
+    "solidity_opened", "sphericity_opened", "bbox_occupancy_raw",
+    "frac_kept_opening", "volume_um3_opened", "c405_shell_minus_core_p50",
+]
+NBR_K = 6
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -186,7 +195,7 @@ def _shape_stats(
         "aspect_yx": float("nan"),
         "solidity": float("nan"),
         "bbox_occupancy": float("nan"),
-        # µm outputs (restored for the production v5d_um model — were dropped
+        # µm outputs (restored for the production model — were dropped
         # by DROP_UM_FEATURES; see the um-vs-vox decision record).
         "volume_um3": float("nan"),
         "bbox_z_extent_um": float("nan"),
@@ -308,7 +317,43 @@ def _knn_features(
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ── z-strip parallelism (within-mouse; max-core) ──────────────────────────────
-_V2CTX: Dict = {}
+_CTX: Dict = {}
+
+
+def _neighbor_quality_features(feat_df: pd.DataFrame,
+                               cent_um: Dict[int, np.ndarray],
+                               k: int = NBR_K) -> pd.DataFrame:
+    """Per-cell neighbour-quality features: mean & min of each _NBR_QFEATS value
+    over the cell's K nearest neighbours (by centroid distance, µm). Neighbours
+    are drawn from cells that are actually segmented (finite features) so junk
+    rows do not pollute the aggregate. Returns one column per (agg, feature)."""
+    ids = feat_df["hcr_id"].to_numpy()
+    pts = np.array([cent_um.get(int(h), (np.nan, np.nan, np.nan)) for h in ids], dtype=float)
+    Q = feat_df[_NBR_QFEATS].to_numpy(dtype=float)
+    finite_pt = np.isfinite(pts).all(axis=1)
+    has_feat = np.isfinite(feat_df["volume_vox_raw"].to_numpy(dtype=float))
+    pool = finite_pt & has_feat
+    cols = [f"nbr_{a}_{q}" for q in _NBR_QFEATS for a in ("mean", "min")]
+    out = {c: np.full(len(ids), np.nan) for c in cols}
+    if int(pool.sum()) >= 1:
+        pool_idx = np.where(pool)[0]
+        tree = cKDTree(pts[pool_idx])
+        k1 = min(k + 1, len(pool_idx))
+        q_global = np.where(finite_pt)[0]
+        _, nn = tree.query(pts[q_global], k=k1)
+        nn = np.atleast_2d(nn)
+        with np.errstate(invalid="ignore"):
+            for r, gi in enumerate(q_global):
+                cand = pool_idx[nn[r]]
+                cand = cand[cand != gi][:k]
+                if cand.size == 0:
+                    continue
+                for j, qf in enumerate(_NBR_QFEATS):
+                    v = Q[cand, j]
+                    if np.isfinite(v).any():
+                        out[f"nbr_mean_{qf}"][gi] = np.nanmean(v)
+                        out[f"nbr_min_{qf}"][gi] = np.nanmin(v)
+    return pd.DataFrame(out, index=feat_df.index)
 
 
 def _feat_workers(n_items: int) -> int:
@@ -325,23 +370,23 @@ def _feat_workers(n_items: int) -> int:
     return max(1, min(w, max(1, n_items)))
 
 
-def _v2_worker_init(sid, ctx_light):
+def _worker_init(sid, ctx_light):
     s = load_subject(sid)
-    _V2CTX.clear()
-    _V2CTX.update(ctx_light)
-    _V2CTX["seg_orig"] = zarr.open(str(_orig_res_path(s)), mode="r")
-    _V2CTX["arr405"] = _ch405_l2(s)
-    _V2CTX["has_405"] = _V2CTX["arr405"] is not None
+    _CTX.clear()
+    _CTX.update(ctx_light)
+    _CTX["seg_orig"] = zarr.open(str(_orig_res_path(s)), mode="r")
+    _CTX["arr405"] = _ch405_l2(s)
+    _CTX["has_405"] = _CTX["arr405"] is not None
 
 
-def _process_strip_v2(task):
+def _process_strip(task):
     """Process one (strip, cell-chunk) task; returns (rows, n_owned, n_oversized, n_missing)."""
     z0_inner, owned = task
-    C = _V2CTX
+    C = _CTX
     seg_orig = C["seg_orig"]; arr405 = C["arr405"]; has_405 = C["has_405"]
     Z_seg = C["Z_seg"]; Y_seg = C["Y_seg"]; X_seg = C["X_seg"]
     seg_z_um = C["seg_z_um"]; seg_xy_um = C["seg_xy_um"]
-    tb_lookup = C["tb_lookup"]; cent_z = C["cent_z"]; stage1 = C["stage1"]
+    tb_lookup = C["tb_lookup"]; cent_z = C["cent_z"]
     z_hi_global = C["z_hi_global"]
     n_owned = 0
     n_oversized = 0
@@ -502,26 +547,14 @@ def _process_strip_v2(task):
                 surface_touching_frac = float(fg_ids.size) / n_rim
                 top_neighbor_overlap_frac = float(counts.max()) / n_rim
                 n_touching = int(uniq_ids.size)
-                nbr_scores = [stage1.get(int(u)) for u in uniq_ids]
-                nbr_scores = [v for v in nbr_scores if v is not None and np.isfinite(v)]
-                if nbr_scores:
-                    mean_score = float(np.mean(nbr_scores))
-                    min_score = float(np.min(nbr_scores))
-                else:
-                    mean_score = float("nan")
-                    min_score = float("nan")
             else:
                 surface_touching_frac = 0.0
                 top_neighbor_overlap_frac = 0.0
                 n_touching = 0
-                mean_score = float("nan")
-                min_score = float("nan")
         else:
             surface_touching_frac = float("nan")
             top_neighbor_overlap_frac = float("nan")
             n_touching = 0
-            mean_score = float("nan")
-            min_score = float("nan")
 
         # ── 405 inside vs outside (using rim of raw) ───────────────────
         if ch405_block is not None and n_rim > 0:
@@ -580,41 +613,38 @@ def _process_strip_v2(task):
             "c405_outside_p50": outside_p50,
             "c405_inside_minus_outside_p50": inside_minus_outside_p50,
             "c405_inside_minus_outside_p90": inside_minus_outside_p90,
-            # adjacency
+            # adjacency (self-contained; no stage-1 dependency)
             "n_touching_neighbors": n_touching,
             "surface_touching_frac": surface_touching_frac,
             "top_neighbor_overlap_frac": top_neighbor_overlap_frac,
-            "mean_touching_score_stage1": mean_score,
-            "min_touching_score_stage1": min_score,
         }
         # ── unified pass: compute axis (v3) + surface (v4) + protrusion (v5)
         #    families from the SAME raw/opened mask + 405 crop computed above
         #    (no re-read of the volume, no re-opening).
-        row.update(all_v3_axis_features(
+        row.update(compute_axis_features(
             mask_raw_tight, mask_opened_tight, img_tight,
             seg_z_um, seg_xy_um, seg_xy_um, bin_um=1.0, compute_dropped_peaks=False,
         ))
-        _fv4 = all_v4_features(
+        _fv4 = compute_surface_features(
             mask_raw_tight, mask_opened_tight, img_tight,
             seg_z_um, seg_xy_um, seg_xy_um, r_core_um=4.0,
         )
-        # v2 + v4 both emit volume_um3_raw; keep v4's as *_v4 (matches the old
-        # 4-parquet merge-suffix the _v5d_um model was trained on).
-        if "volume_um3_raw" in _fv4:
-            _fv4["volume_um3_raw_v4"] = _fv4.pop("volume_um3_raw")
+        # the surface family re-emits volume_um3_raw (bit-identical to the shape
+        # family's); drop the duplicate so each feature appears exactly once.
+        _fv4.pop("volume_um3_raw", None)
         row.update(_fv4)
-        row.update(protrusion_features(mask_crop, mask_opened, seg_crop, hid))
+        row.update(compute_protrusion_features(mask_crop, mask_opened, seg_crop, hid))
         feature_rows.append(row)
     return feature_rows, n_owned, n_oversized, n_missing_in_zarr
 
 
-def extract_roi_features_v2(
+def extract_roi_features(
     s: SubjectData,
     cache: bool = True,
 ) -> pd.DataFrame:
     """Extract v2 per-ROI features (405-only intensity + opening + adjacency)."""
     sid = s.subject_id
-    out_path = _features_v2_cache_path(sid)
+    out_path = _features_cache_path(sid)
     if cache and out_path.exists():
         print(f"  [{sid}] loading cached v2 features from {out_path}")
         return pd.read_parquet(out_path)
@@ -633,16 +663,6 @@ def extract_roi_features_v2(
     has_405 = arr405 is not None
     if not has_405:
         print(f"  [{sid}] WARNING: 405 channel missing — intensity features will be NaN")
-
-    # ── stage-1 scores (for adjacency neighbour scoring) ──────────────────────
-    stage1: Dict[int, float] = {}
-    s1p = _stage1_score_path(sid)
-    if s1p.exists():
-        s1df = pd.read_parquet(s1p)
-        stage1 = dict(zip(s1df["hcr_id"].astype(int), s1df["score"].astype(float)))
-        print(f"  [{sid}] stage-1 scores loaded: {len(stage1)} cells")
-    else:
-        print(f"  [{sid}] WARNING: stage-1 score parquet missing — neighbour score features will be NaN")
 
     # ── kNN tree + centroid lookup ────────────────────────────────────────────
     knn_tree, pts_um = _build_knn_tree(s)
@@ -707,7 +727,7 @@ def extract_roi_features_v2(
     _ctx_light = dict(
         Z_seg=Z_seg, Y_seg=Y_seg, X_seg=X_seg,
         seg_z_um=seg_z_um, seg_xy_um=seg_xy_um,
-        tb_lookup=tb_lookup, cent_z=cent_z, stage1=stage1,
+        tb_lookup=tb_lookup, cent_z=cent_z,
         z_hi_global=z_hi_global,
     )
     # Balanced parallel units: split each strip's cells into spatially-contiguous
@@ -727,18 +747,18 @@ def extract_roi_features_v2(
     print(f"  [{sid}] v2 strips={len(cells_per_strip)} chunks={len(tasks)} "
           f"(~{_chunk} cells/chunk) workers={workers}")
     if workers <= 1:
-        _V2CTX.clear(); _V2CTX.update(_ctx_light)
-        _V2CTX["seg_orig"] = seg_orig
-        _V2CTX["arr405"] = arr405
-        _V2CTX["has_405"] = has_405
-        results = [_process_strip_v2(t) for t in tasks]
+        _CTX.clear(); _CTX.update(_ctx_light)
+        _CTX["seg_orig"] = seg_orig
+        _CTX["arr405"] = arr405
+        _CTX["has_405"] = has_405
+        results = [_process_strip(t) for t in tasks]
     else:
         from concurrent.futures import ProcessPoolExecutor
         from multiprocessing import get_context
         with ProcessPoolExecutor(max_workers=workers, mp_context=get_context("spawn"),
-                                 initializer=_v2_worker_init,
+                                 initializer=_worker_init,
                                  initargs=(sid, _ctx_light)) as _ex:
-            results = list(_ex.map(_process_strip_v2, tasks))
+            results = list(_ex.map(_process_strip, tasks))
     for _rows, _no, _nov, _nm in results:
         feature_rows.extend(_rows)
         n_owned += _no
@@ -762,17 +782,18 @@ def extract_roi_features_v2(
             "c405_shell_minus_core_p50", "c405_shell_minus_core_p90",
             "c405_outside_p50", "c405_inside_minus_outside_p50", "c405_inside_minus_outside_p90",
             "surface_touching_frac", "top_neighbor_overlap_frac",
-            "mean_touching_score_stage1", "min_touching_score_stage1",
         ]
     }
     nan_template["n_touching_neighbors"] = 0
     # unified families: match each old extractor's nan-fill convention
-    for _c in roi_v3_axis_features.feature_columns():       # v3: n_peaks→0 (unless dropped)
-        nan_template[_c] = (0 if ("n_peaks" in _c and _c not in roi_v3_axis_features._DROPPED_PEAK_COLS)
+    for _c in axis_features.feature_columns():       # axis: n_peaks→0 (unless dropped)
+        nan_template[_c] = (0 if ("n_peaks" in _c and _c not in axis_features._DROPPED_PEAK_COLS)
                             else float("nan"))
-    for _c in roi_v4_features.feature_columns():            # v4: all NaN (volume_um3_raw→_v4)
-        nan_template["volume_um3_raw_v4" if _c == "volume_um3_raw" else _c] = float("nan")
-    for _c in roi_v5_features.feature_columns():            # v5: all NaN
+    for _c in surface_features.feature_columns():            # surface family: all NaN
+        if _c == "volume_um3_raw":                           # duplicate of shape family — dropped
+            continue
+        nan_template[_c] = float("nan")
+    for _c in protrusion_features.feature_columns():            # protrusion: all NaN
         nan_template[_c] = float("nan")
 
     seen_set = {int(r["hcr_id"]) for r in feature_rows}
@@ -790,6 +811,12 @@ def extract_roi_features_v2(
     knn_df = _knn_features(knn_tree, pts_um, query_um_arr)
     feat_df = pd.concat([feat_df, knn_df], axis=1)
 
+    # ── neighbour-quality features (self-contained replacement for the stage-1
+    #    neighbour-score pair): aggregate each cell's K nearest neighbours'
+    #    realness features (mean + min). Computed once over the full subject. ──
+    nbr_df = _neighbor_quality_features(feat_df, cent_um)
+    feat_df = pd.concat([feat_df, nbr_df], axis=1)
+
     elapsed = time.time() - t_start
     print(f"  [{sid}] v2 done: {len(feat_df)} ROIs in {elapsed:.1f}s ({elapsed/60:.1f}min)")
     print(f"  [{sid}] v2 columns ({len(feat_df.columns)}): {list(feat_df.columns)}")
@@ -800,9 +827,9 @@ def extract_roi_features_v2(
 
     meta = {
         "subject_id": sid,
-        "version": "v2",
+        "version": "1",
         "channels_used": ["405"] if has_405 else [],
-        "stage1_score_loaded": bool(stage1),
+        "neighbor_quality_k": NBR_K,
         "total_rois": int(len(feat_df)),
         "n_owned_in_strip_pass": int(n_owned),
         "n_oversized": int(n_oversized),
@@ -816,9 +843,9 @@ def extract_roi_features_v2(
         "z_pad": Z_PAD,
         "elapsed_seconds": float(elapsed),
     }
-    with open(_meta_v2_path(sid), "w") as f:
+    with open(_meta_path(sid), "w") as f:
         json.dump(meta, f, indent=2)
-    print(f"  [{sid}] v2 meta saved → {_meta_v2_path(sid)}")
+    print(f"  [{sid}] v2 meta saved → {_meta_path(sid)}")
 
     return feat_df
 
@@ -826,4 +853,4 @@ def extract_roi_features_v2(
 # Public entry point used by features.extract_features.
 def compute(s: SubjectData, cache: bool = True) -> pd.DataFrame:
     """Compute (or load from cache) shape + 405 + adjacency features for subject s."""
-    return extract_roi_features_v2(s, cache=cache)
+    return extract_roi_features(s, cache=cache)

@@ -1,21 +1,18 @@
-"""Public feature-extraction entry point for the v5d _um ROI-quality classifier.
+"""Public feature-extraction entry point for the ROI-quality classifier.
 
 Single call: ``extract_features(sid, cache=True) -> DataFrame``
 
-Merges four per-group feature parquets (shape/v2, axis/v3_extra, surface/v4,
-protrusion/v5) into the 91-column µm-variant frame that ``model.predict`` and
-``model.train`` consume.  No v6_vox features.  No percentile-rank columns.
-
-``volume_um3_raw_v4`` in the target set is a merge-suffix artefact: both v2
-and v4 contain ``volume_um3_raw``; when v4 is merged with suffix ``"_v4"`` on
-collision the v4 copy becomes ``volume_um3_raw_v4`` automatically.
+A single unified pass (``feat_shape.compute``) computes every feature family
+(shape, axis, surface, protrusion, 405 intensity, adjacency, neighbour-quality)
+for each cell at once and writes one ``{sid}_features_all.parquet`` to
+``config.ROI_QUALITY_DIR``.  ``extract_features`` reads that parquet and selects
+the model's feature columns.  Self-contained: 405-only, no upstream model, no
+percentile-rank columns.
 
 Cache strategy
 --------------
-Each group module writes its own parquet to ``config.ROI_QUALITY_DIR`` (keyed
-``{sid}_features_v{2,3_extra,4,5}.parquet``).  When ``cache=True`` and those
-parquets already exist the per-group computation is skipped entirely.
-``extract_features`` itself does NOT write a merged parquet.
+When ``cache=True`` and ``{sid}_features_all.parquet`` exists it is read directly;
+otherwise the unified extractor runs and writes it.
 
 Coordinate frame
 ----------------
@@ -31,12 +28,12 @@ import pandas as pd
 from . import config as _cfg
 from .model import FEATURE_COLUMNS  # noqa: F401 — re-export for convenience
 
-# Cache dir for reading pre-existing per-group parquets.
+# Cache dir for the unified features parquet.
 _CACHE_DIR = _cfg.ROI_QUALITY_DIR
 
 
 def extract_features(sid: str, cache: bool = True) -> pd.DataFrame:
-    """Return the 91-column µm feature matrix for one subject.
+    """Return the µm feature matrix for one subject.
 
     A single unified extractor (`feat_shape.compute`) computes all feature
     families in one z-strip pass — each cell's mask, opening, and 405 crop are

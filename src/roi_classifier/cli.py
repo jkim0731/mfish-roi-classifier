@@ -15,7 +15,7 @@ build-features <sid>
 predict <sid>
     Extract features (from cached parquets) and run inference for subject
     <sid>, writing the contract parquet to config.ROI_QUALITY_DIR:
-        {sid}_stage2_4class_proba_v5d_um.parquet
+        {sid}_roi_quality_proba.parquet
     Columns: hcr_id, p_bad, p_bad_ok, p_good, p_merged, human_label
     (human_label is always present; null for ROIs not in the label log)
 
@@ -82,7 +82,7 @@ def _cmd_predict(args: argparse.Namespace) -> int:
 
     # Write the contract parquet.
     _cfg.ROI_QUALITY_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = _cfg.ROI_QUALITY_DIR / f"{sid}_stage2_4class_proba_v5d_um.parquet"
+    out_path = _cfg.ROI_QUALITY_DIR / f"{sid}_roi_quality_proba.parquet"
     out.to_parquet(out_path, index=False)
     print(f"  contract parquet written -> {out_path}")
     print(f"  shape: {out.shape}, cols: {list(out.columns)}")
@@ -129,26 +129,6 @@ def _cmd_build_bbox(args: argparse.Namespace) -> int:
     df = build_tight_bbox_sid(sid, cache=True, force=args.force)
     print(f"[build-bbox] {sid}: {len(df)} cells -> {tight_bbox_cache_path(sid)}")
     return 0
-
-
-# Module-level workers so they are picklable for a spawn ProcessPool.
-# Each loads its own subject + zarr handles inside the worker process.
-def _crops_worker(sid: str, force: bool) -> str:
-    from .feat_per_cell_crops import build_per_cell_crops_sid
-    build_per_cell_crops_sid(sid, cache=True, force=force)
-    return "crops"
-
-
-def _feature_worker(sid: str, group: str) -> str:
-    from .benchmark_data_loader import load_subject
-    s = load_subject(sid)
-    mod = {
-        "shape": "feat_shape", "axis": "feat_axis",
-        "surface": "feat_surface", "protrusion": "feat_protrusion",
-    }[group]
-    import importlib
-    importlib.import_module(f".{mod}", __package__).compute(s, cache=True)
-    return group
 
 
 def _cmd_build_crops(args: argparse.Namespace) -> int:

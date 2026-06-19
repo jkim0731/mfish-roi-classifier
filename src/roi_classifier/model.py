@@ -1,4 +1,4 @@
-"""Production API for the v5d ROI-quality stage-2 classifier.
+"""Production API for the ROI-quality classifier.
 
 Public entry points:
     predict_subject(sid)  — extract features + run both models → per-ROI scores.
@@ -30,17 +30,17 @@ from sklearn.metrics import (
 from . import config as _cfg
 
 # ──────────────────────────────────────────────────────────────────────────────
-# constants — mirror the _um variant of 05h_train_stage2_v5d.py exactly
+# constants
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Feature parquets are read from ROI_QUALITY_DIR; models from MODELS_DIR.
 # Both default to the same location but can be separated via env vars.
 CACHE_DIR = _cfg.ROI_QUALITY_DIR
 
-# Model files shipped inside models/; names carry the _um suffix.
-MODEL_BINARY = _cfg.MODELS_DIR / "roi_quality_stage2_binary_v5d_um.txt"
-MODEL_FOUR_CLASS = _cfg.MODELS_DIR / "roi_quality_stage2_4class_v5d_um.txt"
-META_JSON = _cfg.MODELS_DIR / "roi_quality_stage2_meta_v5d_um.json"
+# Model files shipped inside models/ (version-agnostic names; lineage in meta).
+MODEL_BINARY = _cfg.MODELS_DIR / "roi_quality_binary.txt"
+MODEL_FOUR_CLASS = _cfg.MODELS_DIR / "roi_quality_4class.txt"
+META_JSON = _cfg.MODELS_DIR / "roi_quality_meta.json"
 
 CLASS_NAMES = ["bad", "bad_ok", "good", "merged"]
 CLASS_TO_IDX = {c: i for i, c in enumerate(CLASS_NAMES)}
@@ -48,19 +48,17 @@ CLASS_TO_IDX = {c: i for i, c in enumerate(CLASS_NAMES)}
 BINARY_POS = {"good", "bad_ok"}
 BINARY_NEG = {"bad", "merged"}
 
-# 91 µm-variant feature columns — loaded verbatim from the shipped meta JSON so
-# they stay in sync with the trained model without manual transcription.
-# These are µm-based shape/surface/protrusion features + a few raw voxel
-# counts (volume_vox_raw, volume_vox_opened, n_protrusion_voxels,
-# protrusion_rim_voxels) + c405 intensity.  No *_pct_subj rank cols.  No v6_vox
-# intensity features.
+# Feature columns — loaded verbatim from the shipped meta JSON so they stay in
+# sync with the trained model without manual transcription. µm shape / surface /
+# axis / protrusion features + a few raw voxel counts + 405 intensity + neighbour-
+# quality aggregates. 405-only; no percentile-rank columns.
 def _load_feature_columns() -> list[str]:
     meta_path = META_JSON
     if not meta_path.exists():
         raise FileNotFoundError(
             f"model meta JSON not found: {meta_path}\n"
             f"Point MFISH_MODELS_DIR at the directory containing "
-            f"roi_quality_stage2_meta_v5d_um.json."
+            f"roi_quality_meta.json."
         )
     with open(meta_path) as _f:
         _meta = json.load(_f)
@@ -68,7 +66,12 @@ def _load_feature_columns() -> list[str]:
 
 FEATURE_COLUMNS: list[str] = _load_feature_columns()
 
-assert len(FEATURE_COLUMNS) == 91, f"expected 91 _um feature columns, got {len(FEATURE_COLUMNS)}"
+# The feature set is defined entirely by the shipped meta. Guard against gross
+# corruption, not an exact count, so the set can evolve via the meta.
+assert len(FEATURE_COLUMNS) >= 80, f"too few feature columns ({len(FEATURE_COLUMNS)}) — meta corrupt?"
+
+# Percentile-rank feature columns: none (kept for meta parity; pct_rank_columns: []).
+PCT_RANK_COLS: list[str] = []
 
 # LightGBM hyper-parameters (identical to 05h trainer)
 LGB_BINARY = dict(
@@ -123,8 +126,8 @@ def predict(
     binary_score : pd.Series indexed by hcr_id, float in [0, 1] (positive = good/bad_ok).
     four_class_proba : pd.DataFrame[hcr_id, bad, bad_ok, good, merged].
     """
-    bin_path   = model_dir / "roi_quality_stage2_binary_v5d_um.txt"
-    multi_path = model_dir / "roi_quality_stage2_4class_v5d_um.txt"
+    bin_path   = model_dir / "roi_quality_binary.txt"
+    multi_path = model_dir / "roi_quality_4class.txt"
     for p in (bin_path, multi_path):
         if not p.exists():
             raise FileNotFoundError(f"model file missing: {p}")
@@ -248,14 +251,14 @@ def train(
 ) -> dict:
     """LOSO cross-validation + production model training.
 
-    Mirrors 05h_train_stage2_v5d.main() but uses this module's API.
+
 
     Writes to out_dir:
-        roi_quality_stage2_binary_v5d_um.txt
-        roi_quality_stage2_4class_v5d_um.txt
-        roi_quality_stage2_meta_v5d_um.json
-        {sid}_stage2_binary_score_v5d_um.parquet  (per-subject OOF)
-        {sid}_stage2_4class_proba_v5d_um.parquet  (per-subject OOF)
+        roi_quality_binary.txt
+        roi_quality_4class.txt
+        roi_quality_meta.json
+        {sid}_roi_quality_binary_oof.parquet  (per-subject OOF)
+        {sid}_roi_quality_4class_oof.parquet  (per-subject OOF)
 
     Returns the meta dict.
     """
@@ -276,7 +279,7 @@ def train(
         ))
 
     # ── BINARY LOSO ──────────────────────────────────────────────────────────
-    print("\n" + "=" * 62 + "\nBINARY (v5d)\n" + "=" * 62)
+    print("\n" + "=" * 62 + "\nBINARY\n" + "=" * 62)
     bin_metrics: list[dict] = []
 
     for held in subjects:
@@ -336,14 +339,14 @@ def train(
             l_held.rename(columns={"label": "human_label"})[["hcr_id", "human_label"]],
             on="hcr_id", how="left",
         )
-        oof.to_parquet(out_dir / f"{held}_stage2_binary_score_v5d_um.parquet", index=False)
+        oof.to_parquet(out_dir / f"{held}_roi_quality_binary_oof.parquet", index=False)
 
     bm = pd.DataFrame(bin_metrics).sort_values("held_subject")
-    print(f"\nbinary v5d LOSO:  mean AUC={bm['auc'].mean():.4f}  "
+    print(f"\nbinary LOSO:  mean AUC={bm['auc'].mean():.4f}  "
           f"AP={bm['ap'].mean():.4f}  Brier={bm['brier'].mean():.4f}")
 
     # ── 4-CLASS LOSO ─────────────────────────────────────────────────────────
-    print("\n" + "=" * 62 + "\n4-CLASS (v5d)\n" + "=" * 62)
+    print("\n" + "=" * 62 + "\n4-CLASS\n" + "=" * 62)
     multi_metrics: list[dict] = []
     overall_cm = np.zeros((len(CLASS_NAMES), len(CLASS_NAMES)), dtype=int)
 
@@ -407,14 +410,14 @@ def train(
             l_held.rename(columns={"label": "human_label"})[["hcr_id", "human_label"]],
             on="hcr_id", how="left",
         )
-        oof.to_parquet(out_dir / f"{held}_stage2_4class_proba_v5d_um.parquet", index=False)
+        oof.to_parquet(out_dir / f"{held}_roi_quality_4class_oof.parquet", index=False)
 
     mm = pd.DataFrame(multi_metrics).sort_values("held_subject")
-    print(f"\n4-class v5d LOSO:  mean acc={mm['acc'].mean():.4f}  "
+    print(f"\n4-class LOSO:  mean acc={mm['acc'].mean():.4f}  "
           f"mean f1_macro={mm['f1_macro'].mean():.4f}")
 
     # ── PRODUCTION MODELS ────────────────────────────────────────────────────
-    print("\n" + "=" * 62 + "\nproduction v5d models\n" + "=" * 62)
+    print("\n" + "=" * 62 + "\nproduction models\n" + "=" * 62)
 
     Xb_parts, yb_parts = [], []
     for sid in subjects:
@@ -429,7 +432,7 @@ def train(
     bin_prod = lgb.train(LGB_BINARY, lgb.Dataset(Xb, yb),
                          num_boost_round=n_iter_b,
                          callbacks=[lgb.log_evaluation(0)])
-    bin_prod.save_model(str(out_dir / "roi_quality_stage2_binary_v5d_um.txt"))
+    bin_prod.save_model(str(out_dir / "roi_quality_binary.txt"))
     print(f"  binary: {len(Xb)} rows, {n_iter_b} iters")
 
     Xm_parts, ym_parts = [], []
@@ -445,11 +448,11 @@ def train(
     multi_prod = lgb.train(LGB_MULTI, lgb.Dataset(Xm, ym),
                            num_boost_round=n_iter_m,
                            callbacks=[lgb.log_evaluation(0)])
-    multi_prod.save_model(str(out_dir / "roi_quality_stage2_4class_v5d_um.txt"))
+    multi_prod.save_model(str(out_dir / "roi_quality_4class.txt"))
     print(f"  4-class: {len(Xm)} rows, {n_iter_m} iters")
 
     meta: dict = {
-        "version": "v5d",
+        "version": "1",
         "feature_columns": FEATURE_COLUMNS,
         "subjects": subjects,
         "class_names": CLASS_NAMES,
@@ -473,6 +476,6 @@ def train(
             "params": LGB_MULTI,
         },
     }
-    (out_dir / "roi_quality_stage2_meta_v5d_um.json").write_text(json.dumps(meta, indent=2))
-    print(f"  meta -> {out_dir / 'roi_quality_stage2_meta_v5d_um.json'}")
+    (out_dir / "roi_quality_meta.json").write_text(json.dumps(meta, indent=2))
+    print(f"  meta -> {out_dir / 'roi_quality_meta.json'}")
     return meta
