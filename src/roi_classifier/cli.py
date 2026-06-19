@@ -102,12 +102,16 @@ def _cmd_train(args: argparse.Namespace) -> int:
     from .model import train
     from .benchmark_data_loader import BENCHMARK_SUBJECTS
 
-    label_log = Path(args.label_log) if args.label_log else (
-        _cfg.ROI_QUALITY_DIR / "roi_qc_actions.jsonl"
+    # --label-assets (a directory of per-session *.jsonl assets, merged
+    # newest-wins) takes precedence over a single --label-log file.
+    label_log = Path(
+        getattr(args, "label_assets", None) or args.label_log
+        or (_cfg.ROI_QUALITY_DIR / "roi_qc_actions.jsonl")
     )
     if not label_log.exists():
-        print(f"[train] label log not found: {label_log}", file=sys.stderr)
-        print("  Pass --label-log <path> or set MFISH_ROI_QUALITY_DIR.", file=sys.stderr)
+        print(f"[train] label log/assets not found: {label_log}", file=sys.stderr)
+        print("  Pass --label-assets <dir> / --label-log <file>, or set MFISH_ROI_QUALITY_DIR.",
+              file=sys.stderr)
         return 1
 
     subjects = args.subjects if args.subjects else BENCHMARK_SUBJECTS
@@ -201,8 +205,13 @@ def main(argv: list[str] | None = None) -> int:
 
     p_train = sub.add_parser("train", help="LOSO cross-validation + production model training.")
     p_train.add_argument(
+        "--label-assets", dest="label_assets", default=None,
+        help="Directory of per-session *.jsonl label assets (merged newest-wins). "
+             "Takes precedence over --label-log."
+    )
+    p_train.add_argument(
         "--label-log", dest="label_log", default=None,
-        help="Path to roi_qc_actions.jsonl (default: ROI_QUALITY_DIR/roi_qc_actions.jsonl)"
+        help="Path to a single roi_qc_actions.jsonl (default: ROI_QUALITY_DIR/roi_qc_actions.jsonl)"
     )
     p_train.add_argument(
         "subjects", nargs="*",

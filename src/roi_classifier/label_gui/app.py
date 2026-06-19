@@ -69,6 +69,7 @@ from .gui import (
     _ROI,
     _RoiCrops,
     _append_label,
+    _code_version,
     _load_all_features,
     _load_label_log,
     _load_roi_crops,
@@ -76,6 +77,7 @@ from .gui import (
     _make_roi_from_row,
     _planes_for_channel,
     _sample_uncertain,
+    _segmentation_asset,
 )
 import pandas as pd  # noqa: E402  (used by the local samplers)
 
@@ -103,6 +105,7 @@ _PROBA_ORDER = ("bad", "bad_ok", "good", "merged")
 # the user reruns the trainer) the panel is rebuilt with
 # the new top-N list.
 from .. import config as _cfg  # noqa: E402
+from ..model import FEATURE_COLUMNS  # noqa: E402  (embed these in each label record)
 _QUALITY_4CLASS_MODEL = _cfg.MODELS_DIR / "roi_quality_4class.txt"
 _TOP_FEATURE_N = 10
 
@@ -189,30 +192,37 @@ def _now_iso() -> str:
 
 
 def _active_labels(label_log: pd.DataFrame, sid: str) -> dict[int, str]:
-    """Return {hcr_id: label} for `sid`, replaying `_undone_` tombstones.
-
-    A `_undone_` record cancels the most recent label for a (sid, hcr_id)
-    pair.  The result is the *current* labelled state.
+    """Return {hcr_id: label} for `sid` — the *latest* event per cell wins
+    (a real label sets it, an `_undone_` clears it), across merged sessions/assets.
     """
     if label_log.empty:
         return {}
-    sub = label_log[label_log["sid"] == sid].copy()
+    sub = label_log[label_log["sid"].astype(str) == str(sid)].copy()
     if sub.empty:
         return {}
-    tomb_keys: set[int] = set()
-    if "label" in sub.columns and (sub["label"] == "_undone_").any():
-        for _, r in sub[sub["label"] == "_undone_"].iterrows():
+    valid = ("good", "bad", "bad_ok", "merged", "unsure")
+
+    def _hid(r):
+        if r.get("label") == "_undone_":
             ub = r.get("undoes") or {}
             try:
-                tomb_keys.add(int(ub.get("hcr_id", -1)))
+                return int(ub.get("hcr_id", -1))
             except (TypeError, ValueError):
-                pass
-    sub = sub[sub["label"].isin(["good", "bad", "bad_ok", "merged", "unsure"])]
-    sub = sub[~sub["hcr_id"].astype(int).isin(tomb_keys)]
+                return -1
+        try:
+            return int(r["hcr_id"])
+        except (TypeError, ValueError, KeyError):
+            return -1
+
+    sub["_hid"] = sub.apply(_hid, axis=1)
+    sub = sub[(sub["_hid"] >= 0) & (sub["label"].isin((*valid, "_undone_")))]
+    if sub.empty:
+        return {}
     if "ts" in sub.columns:
-        sub = sub.sort_values("ts")
-    sub = sub.drop_duplicates(subset=["hcr_id"], keep="last")
-    return dict(zip(sub["hcr_id"].astype(int), sub["label"]))
+        sub = sub.sort_values("ts", kind="stable")
+    last = sub.groupby("_hid", as_index=False).last()
+    last = last[last["label"].isin(valid)]
+    return dict(zip(last["_hid"].astype(int), last["label"]))
 
 
 def _sample_from_candidates(
@@ -694,11 +704,24 @@ class StandaloneLabeller:
         if roi is None:
             return
         pred_cls, pred_p = _predicted_class(roi.proba_4class)
+        # Self-contained record: embed this cell's model feature values (frozen at
+        # the code_commit below) so training needs only the labels asset.
+        feats: dict[str, float | None] = {}
+        for k in FEATURE_COLUMNS:
+            v = roi.features.get(k)
+            try:
+                fv = float(v)
+                feats[k] = None if fv != fv else fv          # fv!=fv ⇒ NaN
+            except (TypeError, ValueError):
+                feats[k] = None
         rec = {
             "ts": _now_iso(),
             "sid": roi.sid,
             "hcr_id": roi.hcr_id,
             "label": label,
+            "segmentation_asset": _segmentation_asset(roi.sid),  # {name, id} — disambiguates hcr_id
+            "code_commit": _code_version(),                      # extractor + model version
+            "features": feats,                                   # frozen feature values (self-contained)
             "model_binary_score": roi.score,
             "model_proba": dict(roi.proba_4class),
             "model_pred_class": pred_cls,
@@ -1017,12 +1040,39 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "When set, ROIs are walked in CSV order (top-priority "
                         "first) instead of random uncertain-band sampling. "
                         "Already-labelled rows are still skipped.")
+    p.add_argument("--label-assets", default=None, type=Path,
+                   help="Prior labels to READ (a file, or a directory of attached "
+                        "*.jsonl label assets, merged newest-wins) — for priors/skip "
+                        "and the review pool. Default: the single label log.")
+    p.add_argument("--label-out", default=None, type=Path,
+                   help="Where THIS session's labels are WRITTEN. A directory → a "
+                        "per-session file roi_qc_actions_<UTCstamp>.jsonl inside it; "
+                        "a file → that file. Default: $MFISH_LABEL_OUT_DIR (per-session) "
+                        "else the default label log.")
     return p.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     sids: list[str] = args.sid if args.sid else list(_BENCHMARK_SUBJECTS)
+
+    # Per-session, timestamped label assets: READ prior labels from --label-assets
+    # (a dir of *.jsonl, merged newest-wins), WRITE this session to its own file.
+    import os as _os
+    from . import gui as _gui
+    if args.label_assets is not None:
+        _gui.LABEL_READ_SRC = args.label_assets
+    out_arg = args.label_out or (Path(_os.environ["MFISH_LABEL_OUT_DIR"])
+                                 if _os.environ.get("MFISH_LABEL_OUT_DIR") else None)
+    if out_arg is not None:
+        out_arg = Path(out_arg)
+        if out_arg.is_dir() or out_arg.suffix == "":
+            stamp = _dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+            out_arg.mkdir(parents=True, exist_ok=True)
+            _gui.LABEL_OUT = out_arg / f"roi_qc_actions_{stamp}.jsonl"
+        else:
+            _gui.LABEL_OUT = out_arg
+    label_out = _gui.LABEL_OUT
     candidates: dict[str, list[int]] | None = None
     if args.candidates is not None:
         df = pd.read_csv(args.candidates)
@@ -1045,7 +1095,7 @@ def main(argv: list[str] | None = None) -> int:
         seed=args.seed,
         candidates=candidates,
     )
-    print(f"  loaded {len(app.rois)} ROIs for sid={sids[app.subject_idx]}  log={LABEL_LOG}")
+    print(f"  loaded {len(app.rois)} ROIs for sid={sids[app.subject_idx]}  writing → {label_out}")
     print("  shortcuts: g/b/o/e/u label (good/bad/bad_ok/merged/unsure)  s skip  z undo  q quit  "
           "j/k arrows or mouse-wheel scroll z  m MIP  1/2/3 channel  "
           "n/p next/prev subject")

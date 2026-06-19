@@ -179,29 +179,64 @@ def predict_subject(sid: str) -> pd.DataFrame:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _load_label_log(label_log_path: Path) -> pd.DataFrame:
-    if not label_log_path.exists():
-        raise FileNotFoundError(f"label log missing: {label_log_path}")
-    return pd.read_json(label_log_path, lines=True)
+    """Read one label-log file, or merge every ``*.jsonl`` under a directory.
+
+    Labels are kept as **per-session, timestamped assets** (one jsonl per
+    labelling session). Passing the directory of attached label assets merges
+    them all into one event frame; newest-wins is resolved by ``_active_labels``
+    using each event's ``ts``.
+    """
+    p = Path(label_log_path)
+    files = sorted(p.glob("*.jsonl")) if p.is_dir() else ([p] if p.exists() else [])
+    if not files:
+        raise FileNotFoundError(f"no label log(s) found at: {label_log_path}")
+    return pd.concat([pd.read_json(f, lines=True) for f in files], ignore_index=True)
+
+
+_LABELS = ("good", "bad", "bad_ok", "merged", "unsure")
+
+
+def _resolve_active(sub: pd.DataFrame) -> pd.DataFrame:
+    """Last-event-per-(hcr_id) resolution over a single subject's event stream.
+
+    For each cell, the *latest* event by ``ts`` wins: a real label sets it, an
+    ``_undone_`` event (whose target is in ``undoes.hcr_id``) clears it. This
+    handles label → undo → re-label correctly across merged sessions/assets.
+    """
+    if sub.empty:
+        return pd.DataFrame(columns=["hcr_id", "label"])
+    sub = sub.copy()
+
+    def _target_hid(r):
+        if r.get("label") == "_undone_":
+            ub = r.get("undoes") or {}
+            try:
+                return int(ub.get("hcr_id", -1))
+            except (TypeError, ValueError):
+                return -1
+        try:
+            return int(r["hcr_id"])
+        except (TypeError, ValueError, KeyError):
+            return -1
+
+    sub["_hid"] = sub.apply(_target_hid, axis=1)
+    sub = sub[(sub["_hid"] >= 0) & (sub["label"].isin((*_LABELS, "_undone_")))]
+    if sub.empty:
+        return pd.DataFrame(columns=["hcr_id", "label"])
+    if "ts" in sub.columns:
+        sub = sub.sort_values("ts", kind="stable")
+    last = sub.groupby("_hid", as_index=False).last()
+    last = last[last["label"].isin(_LABELS)]          # drop cells whose last event was _undone_
+    return pd.DataFrame({
+        "hcr_id": last["_hid"].astype(int).to_numpy(),
+        "label": last["label"].to_numpy(),
+    }).reset_index(drop=True)
 
 
 def _active_labels(log: pd.DataFrame, sid: str) -> pd.DataFrame:
-    sub = log[log["sid"].astype(str) == sid].copy()
-    if sub.empty:
+    if log.empty:
         return pd.DataFrame(columns=["hcr_id", "label"])
-    tomb_ids: set[int] = set()
-    if (sub["label"] == "_undone_").any():
-        for _, r in sub[sub["label"] == "_undone_"].iterrows():
-            ub = r.get("undoes") or {}
-            try:
-                tomb_ids.add(int(ub.get("hcr_id", -1)))
-            except (TypeError, ValueError):
-                pass
-    sub = sub[sub["label"].isin(["good", "bad", "bad_ok", "merged", "unsure"])]
-    sub = sub[~sub["hcr_id"].astype(int).isin(tomb_ids)]
-    if "ts" in sub.columns:
-        sub = sub.sort_values("ts")
-    sub = sub.drop_duplicates(subset=["hcr_id"], keep="last")
-    return sub[["hcr_id", "label"]].reset_index(drop=True)
+    return _resolve_active(log[log["sid"].astype(str) == str(sid)])
 
 
 def _build_matrix(df: pd.DataFrame) -> pd.DataFrame:
@@ -248,10 +283,14 @@ def train(
     subjects: list[str],
     label_log_path: Path,
     out_dir: Path = _cfg.MODELS_DIR,
+    feats: dict | None = None,
 ) -> dict:
     """LOSO cross-validation + production model training.
 
-
+    `feats`: optional {sid: DataFrame[hcr_id, *FEATURE_COLUMNS]} of pre-built
+    feature matrices. When None (default) they are extracted via
+    `features.extract_features`. `train_embedded` passes the label assets'
+    embedded features here so no extraction / attached HCR data is needed.
 
     Writes to out_dir:
         roi_quality_binary.txt
@@ -262,13 +301,13 @@ def train(
 
     Returns the meta dict.
     """
-    from .features import extract_features
-
     out_dir.mkdir(parents=True, exist_ok=True)
     log = _load_label_log(label_log_path)
     print(f"label log: {len(log)} rows")
 
-    feats = {sid: extract_features(sid) for sid in subjects}
+    if feats is None:
+        from .features import extract_features
+        feats = {sid: extract_features(sid) for sid in subjects}
     labs  = {sid: _active_labels(log, sid) for sid in subjects}
 
     print("\nactive label counts per subject:")
@@ -479,3 +518,96 @@ def train(
     (out_dir / "roi_quality_meta.json").write_text(json.dumps(meta, indent=2))
     print(f"  meta -> {out_dir / 'roi_quality_meta.json'}")
     return meta
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# embedded-features training (light: labels asset only, no extraction)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _resolve_active_records(log: pd.DataFrame, sid: str) -> pd.DataFrame:
+    """Winning labeled records for `sid` (newest-wins) with each record's embedded
+    `features` dict expanded to FEATURE_COLUMNS columns (+ hcr_id, label, code_commit)."""
+    cols = ["hcr_id", "label", "code_commit", *FEATURE_COLUMNS]
+    sub = log[log["sid"].astype(str) == str(sid)].copy()
+    if sub.empty:
+        return pd.DataFrame(columns=cols)
+
+    def _hid(r):
+        if r.get("label") == "_undone_":
+            ub = r.get("undoes") or {}
+            try:
+                return int(ub.get("hcr_id", -1))
+            except (TypeError, ValueError):
+                return -1
+        try:
+            return int(r["hcr_id"])
+        except (TypeError, ValueError, KeyError):
+            return -1
+
+    sub["_hid"] = sub.apply(_hid, axis=1)
+    sub = sub[(sub["_hid"] >= 0) & (sub["label"].isin((*_LABELS, "_undone_")))]
+    if sub.empty:
+        return pd.DataFrame(columns=cols)
+    if "ts" in sub.columns:
+        sub = sub.sort_values("ts", kind="stable")
+    last = sub.groupby("_hid", as_index=False).last()
+    last = last[last["label"].isin(_LABELS)]
+    if last.empty:
+        return pd.DataFrame(columns=cols)
+    fser = (last["features"].apply(lambda x: x if isinstance(x, dict) else {})
+            if "features" in last.columns else pd.Series([{}] * len(last)))
+    fnorm = pd.json_normalize(fser).reindex(columns=FEATURE_COLUMNS)
+    out = pd.DataFrame({
+        "hcr_id": last["_hid"].astype(int).to_numpy(),
+        "label": last["label"].to_numpy(),
+        "code_commit": (last["code_commit"].to_numpy() if "code_commit" in last.columns
+                        else [None] * len(last)),
+    })
+    return pd.concat([out.reset_index(drop=True), fnorm.reset_index(drop=True)], axis=1)
+
+
+def _warn_label_provenance(log: pd.DataFrame, subjects: list[str]) -> None:
+    """Warn on conflicting (changed) labels and re-labeled ROIs. Warnings only —
+    training proceeds on the newest-wins result. Feature-set validity is enforced
+    by the embedded-feature coverage check in `train_embedded` (by feature name),
+    NOT by code_commit: the repo commit changes for reasons unrelated to extraction,
+    so it would false-alarm. `code_commit` stays in each record as provenance only."""
+    sub = log[log["sid"].astype(str).isin([str(s) for s in subjects])]
+    lab = sub[sub["label"].isin(_LABELS)]
+    relabeled = changed = 0
+    for sid in subjects:
+        g = lab[lab["sid"].astype(str) == str(sid)].groupby("hcr_id")["label"]
+        if g.ngroups == 0:
+            continue
+        relabeled += int((g.count() > 1).sum())
+        changed += int((g.nunique() > 1).sum())
+    if relabeled:
+        print(f"[warn] re-labeled ROIs: {relabeled} cell(s) have >1 label event (newest-wins applied).")
+    if changed:
+        print(f"[warn] label name mismatch: {changed} cell(s) received conflicting label VALUES "
+              f"across events (the newest wins).")
+
+
+def train_embedded(
+    subjects: list[str],
+    label_log_path: Path,
+    out_dir: Path = _cfg.MODELS_DIR,
+) -> dict:
+    """LIGHT trainer: build the matrix ONLY from each label's embedded `features`
+    (no feature extraction, no attached HCR/features assets). Warns on conflicting
+    labels and re-labeled ROIs, and skips+warns any label whose embedded features
+    don't cover the current feature set (by name)."""
+    log = _load_label_log(label_log_path)
+    print(f"label log: {len(log)} rows")
+    _warn_label_provenance(log, subjects)
+
+    feats: dict = {}
+    for sid in subjects:
+        rec = _resolve_active_records(log, sid)
+        usable = rec.dropna(subset=FEATURE_COLUMNS, how="all")
+        n_missing = len(rec) - len(usable)
+        if n_missing:
+            print(f"[warn] {sid}: {n_missing} active label(s) carry no current-feature-set values "
+                  f"→ skipped (embedded feature names don't match; light trainer does NOT extract).")
+        feats[sid] = usable[["hcr_id", *FEATURE_COLUMNS]].reset_index(drop=True)
+    return train(subjects=subjects, label_log_path=label_log_path, out_dir=out_dir, feats=feats)

@@ -41,6 +41,8 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import os as _os
+import subprocess as _subprocess
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -69,6 +71,14 @@ from .. import config as _cfg
 CACHE = _cfg.ROI_QUALITY_DIR
 TIGHT_BBOX = _cfg.TIGHT_BBOX_DIR
 LABEL_LOG = _cfg.ROI_QUALITY_DIR / "roi_qc_actions.jsonl"
+
+# Labels are per-session, timestamped assets. LABEL_READ_SRC is where prior labels
+# are READ from (a file, or a directory of attached *.jsonl label assets); LABEL_OUT
+# is where THIS session's events are WRITTEN (its own timestamped file). The GUI
+# launcher (app.main) sets these from --label-assets / --label-out; both default to
+# the single LABEL_LOG for back-compat.
+LABEL_READ_SRC: Any = None
+LABEL_OUT: Path = LABEL_LOG
 
 SUBJECTS = ["755252", "767018", "767022", "782149", "788406", "790322"]
 HCR_DATA_ROOTS: dict[str, Path] = {}  # populated lazily by `_hcr_dir`
@@ -107,25 +117,94 @@ def _open_zarr(path: Path):
     return zarr.open(str(path), mode="r")
 
 
-def _load_label_log() -> pd.DataFrame:
-    if not LABEL_LOG.exists():
-        return pd.DataFrame(columns=["ts", "sid", "hcr_id", "label"])
-    rows = []
-    with open(LABEL_LOG) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
+# ── label provenance: segmentation data-asset identity + code version ─────────
+def _datasets_json_path() -> Path | None:
+    """Locate the capsule's CodeOcean attached-datasets manifest."""
+    cands = []
+    if _os.environ.get("MFISH_DATASETS_JSON"):
+        cands.append(Path(_os.environ["MFISH_DATASETS_JSON"]))
+    cands += [Path("/root/capsule/.codeocean/datasets.json"),
+              Path.cwd() / ".codeocean" / "datasets.json"]
+    for p in cands:
+        if p.exists():
+            return p
+    return None
+
+
+_ASSET_ID_MAP: dict[str, str] | None = None
+
+
+def _asset_id_for(mount_name: str) -> str | None:
+    """CodeOcean data-asset id for a mounted asset folder name (None if unknown)."""
+    global _ASSET_ID_MAP
+    if _ASSET_ID_MAP is None:
+        _ASSET_ID_MAP = {}
+        p = _datasets_json_path()
+        if p is not None:
             try:
-                rows.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-    return pd.DataFrame(rows)
+                for a in json.loads(p.read_text()).get("attached_datasets", []):
+                    if a.get("mount") and a.get("id"):
+                        _ASSET_ID_MAP[a["mount"]] = a["id"]
+            except Exception:
+                pass
+    return _ASSET_ID_MAP.get(mount_name)
+
+
+def _segmentation_asset(sid: str) -> dict:
+    """{name, id} of the HCR_*_processed asset that defines this subject's hcr_ids."""
+    try:
+        name = _hcr_dir(sid).name
+    except Exception:
+        return {"name": None, "id": None}
+    return {"name": name, "id": _asset_id_for(name)}
+
+
+_CODE_VERSION: str | None = None
+
+
+def _code_version() -> str:
+    """git short-hash of the installed mfish-roi-classifier (extractor + model version)."""
+    global _CODE_VERSION
+    if _CODE_VERSION is None:
+        try:
+            import roi_classifier as _rc
+            repo = Path(_rc.__file__).resolve().parents[2]
+            _CODE_VERSION = _subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
+                text=True, stderr=_subprocess.DEVNULL).strip()
+        except Exception:
+            _CODE_VERSION = "unknown"
+    return _CODE_VERSION
+
+
+def _label_read_files() -> list[Path]:
+    src = LABEL_READ_SRC if LABEL_READ_SRC is not None else LABEL_LOG
+    p = Path(src)
+    if p.is_dir():
+        return sorted(p.glob("*.jsonl"))
+    return [p] if p.exists() else []
+
+
+def _load_label_log() -> pd.DataFrame:
+    """Merge prior labels from LABEL_READ_SRC (a file, or a directory of
+    per-session *.jsonl label assets) into one event frame."""
+    rows = []
+    for fp in _label_read_files():
+        with open(fp) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["ts", "sid", "hcr_id", "label"])
 
 
 def _append_label(record: dict[str, Any]) -> None:
-    LABEL_LOG.parent.mkdir(parents=True, exist_ok=True)
-    with open(LABEL_LOG, "a") as f:
+    LABEL_OUT.parent.mkdir(parents=True, exist_ok=True)
+    with open(LABEL_OUT, "a") as f:
         f.write(json.dumps(record) + "\n")
 
 
