@@ -652,7 +652,7 @@ class LabelSession:
             "sid": roi.sid,
             "hcr_id": roi.hcr_id,
             "label": label,
-            "stage1_score": roi.score,
+            "model_binary_score": roi.score,
             "reviewer": self.reviewer,
             "session_token": self.token,
         }
