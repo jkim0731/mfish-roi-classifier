@@ -310,7 +310,7 @@ def _sample_uncertain(
 ) -> list[_ROI]:
     feats = _load_all_features(sid)
     quality_proba = _load_quality_proba(sid)
-    bbox = pd.read_parquet(TIGHT_BBOX / f"{sid}_hcr_cell_tight_bbox_v1.parquet")
+    bbox = pd.read_parquet(TIGHT_BBOX / f"{sid}_hcr_cell_tight_bbox.parquet")
 
     df = feats.merge(quality_proba, on="hcr_id").merge(bbox, on="hcr_id", how="inner")
     lo, hi = score_band

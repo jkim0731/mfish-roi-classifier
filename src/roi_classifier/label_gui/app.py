@@ -242,7 +242,7 @@ def _sample_from_candidates(
         return []
     feats = _load_all_features(sid)
     quality_proba = _load_quality_proba(sid)
-    bbox = pd.read_parquet(TIGHT_BBOX / f"{sid}_hcr_cell_tight_bbox_v1.parquet")
+    bbox = pd.read_parquet(TIGHT_BBOX / f"{sid}_hcr_cell_tight_bbox.parquet")
     df = feats.merge(quality_proba, on="hcr_id").merge(bbox, on="hcr_id", how="inner")
 
     keep = [h for h in hcr_ids if h not in skip_hcr_ids]
@@ -266,7 +266,7 @@ def _sample_labelled(
         return [], {}
     feats = _load_all_features(sid)
     quality_proba = _load_quality_proba(sid)
-    bbox = pd.read_parquet(TIGHT_BBOX / f"{sid}_hcr_cell_tight_bbox_v1.parquet")
+    bbox = pd.read_parquet(TIGHT_BBOX / f"{sid}_hcr_cell_tight_bbox.parquet")
     df = feats.merge(quality_proba, on="hcr_id").merge(bbox, on="hcr_id", how="inner")
     df = df[df["hcr_id"].astype(int).isin(active.keys())]
     if df.empty:
