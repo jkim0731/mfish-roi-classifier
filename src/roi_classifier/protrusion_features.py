@@ -1,4 +1,4 @@
-"""Per-ROI v5 features: protrusion-touches-other-ROI.
+"""Per-ROI protrusion features: protrusion-touches-other-ROI.
 
 Definition: protrusion = mask_raw & ~mask_opened (voxels removed by binary
 opening). Question: do those protrusion voxels' immediate neighbors include
@@ -28,7 +28,7 @@ from typing import Dict
 import numpy as np
 import scipy.ndimage as ndi
 
-# Re-use v2's connectivity-1 cross structure for consistency.
+# Re-use a connectivity-1 cross structure for consistency.
 _CROSS_3D = ndi.generate_binary_structure(3, 1)
 
 

@@ -1,4 +1,4 @@
-"""v3 axis / projection / waist features for HCR ROI quality classifier.
+"""Axis / projection / waist features for HCR ROI quality classifier.
 
 Pure functions; called per-cell from `feat_axis.py`.
 
@@ -418,7 +418,7 @@ def compute_axis_features(
 
 
 def feature_columns() -> list:
-    """Stable list of v3-NEW feature column names (used to build NaN rows for
+    """Stable list of axis feature column names (used to build NaN rows for
     cells we never own)."""
     cols = [
         "axis3d_extent_um", "axis3d_lambda1_um2", "axis3d_lambda2_um2", "axis3d_lambda3_um2",

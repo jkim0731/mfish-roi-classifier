@@ -1,7 +1,7 @@
 """Per-cell tight-bbox builder for the ROI-quality feature extractors.
 
-The shape (v2), axis (v3) and surface (v4) feature modules **read** a per-cell
-tight-bbox parquet (`{sid}_hcr_cell_tight_bbox_v1.parquet` in
+The feature extractor (`feat_shape`) **reads** a per-cell
+tight-bbox parquet (`{sid}_hcr_cell_tight_bbox.parquet` in
 `MFISH_TIGHT_BBOX_DIR`) to drive their z-strip iteration without a full-volume
 `find_objects`.  This module **builds** that parquet from the level-2
 segmentation (`segmentation_mask_orig_res.zarr`).
@@ -72,7 +72,7 @@ def _orig_res_path(s: SubjectData) -> Path:
 
 
 def tight_bbox_cache_path(sid: str) -> Path:
-    return TIGHT_BBOX_DIR / f"{sid}_hcr_cell_tight_bbox_v1.parquet"
+    return TIGHT_BBOX_DIR / f"{sid}_hcr_cell_tight_bbox.parquet"
 
 
 def build_tight_bbox(s: SubjectData, cache: bool = True, force: bool = False) -> pd.DataFrame:

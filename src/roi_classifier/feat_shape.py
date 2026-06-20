@@ -1,10 +1,10 @@
 """Per-ROI feature extractor for the HCR ROI pass/fail classifier (S11).
 
-Redesign (2026-04-30) based on user feedback that v1's channel
+Redesign (2026-04-30) based on the corrected understanding that the 405 channel
 interpretation was wrong:
   - 405 is Rn28S (cytoplasmic ribosomal RNA, *bright in cytoplasm / dim in
     nucleus*).  Good cells therefore have a DIM CORE and a BRIGHT SHELL —
-    the opposite polarity of v1's `c405_peak_inside`.
+    the opposite of a naive bright-core (`c405_peak_inside`) assumption.
   - 488 is GFP, expressed in a subpopulation only.  Not a membrane marker.
     Brightness on 488 says nothing about ROI quality, so 488 / 514 / 561 /
     594 are dropped from intensity features.
@@ -45,7 +45,7 @@ Output schema (~42 features, all numeric or bool):
   Sanity                   : tight_bbox_in_pickle_bbox,
                              volume_pickle_minus_zarr_l2_eq
 
-Coordinates / data sources are identical to v1: level-2
+Coordinates / data sources: level-2
 `segmentation_mask_orig_res.zarr` and `image_tile_fusing/fused/channel_405.zarr`
 `["2"]`.  (Historical detail lived in the now-removed `roi_quality.py`.)
 
@@ -618,7 +618,7 @@ def _process_strip(task):
             "surface_touching_frac": surface_touching_frac,
             "top_neighbor_overlap_frac": top_neighbor_overlap_frac,
         }
-        # ── unified pass: compute axis (v3) + surface (v4) + protrusion (v5)
+        # ── unified pass: compute axis + surface + protrusion
         #    families from the SAME raw/opened mask + 405 crop computed above
         #    (no re-read of the volume, no re-opening).
         row.update(compute_axis_features(
@@ -642,11 +642,11 @@ def extract_roi_features(
     s: SubjectData,
     cache: bool = True,
 ) -> pd.DataFrame:
-    """Extract v2 per-ROI features (405-only intensity + opening + adjacency)."""
+    """Extract per-ROI features (405-only intensity + opening + adjacency)."""
     sid = s.subject_id
     out_path = _features_cache_path(sid)
     if cache and out_path.exists():
-        print(f"  [{sid}] loading cached v2 features from {out_path}")
+        print(f"  [{sid}] loading cached features from {out_path}")
         return pd.read_parquet(out_path)
 
     t_start = time.time()
@@ -656,7 +656,7 @@ def extract_roi_features(
     _, _, Z_seg, Y_seg, X_seg = seg_orig.shape
     seg_xy_um = float(s.hcr_xy_um)
     seg_z_um = float(s.hcr_z_um)
-    print(f"\n[{sid}] v2 extract | seg shape Z={Z_seg} Y={Y_seg} X={X_seg} | "
+    print(f"\n[{sid}] extract | seg shape Z={Z_seg} Y={Y_seg} X={X_seg} | "
           f"xy={seg_xy_um:.4f} µm  z={seg_z_um:.4f} µm")
 
     arr405 = _ch405_l2(s)
@@ -689,7 +689,7 @@ def extract_roi_features(
 
     # Load cached tight bboxes (level-2) — used to drive iteration without
     # find_objects on the full strip.  Required for performance.
-    tb_path = TIGHT_BBOX_CACHE / f"{sid}_hcr_cell_tight_bbox_v1.parquet"
+    tb_path = TIGHT_BBOX_CACHE / f"{sid}_hcr_cell_tight_bbox.parquet"
     if not tb_path.exists():
         raise FileNotFoundError(
             f"tight bbox cache missing: {tb_path}.  Build it first with "
@@ -744,7 +744,7 @@ def extract_roi_features(
         for _i in range(0, len(_cells), _chunk):
             tasks.append((_z0, _cells[_i:_i + _chunk]))
     workers = _feat_workers(max(1, len(tasks)))
-    print(f"  [{sid}] v2 strips={len(cells_per_strip)} chunks={len(tasks)} "
+    print(f"  [{sid}] strips={len(cells_per_strip)} chunks={len(tasks)} "
           f"(~{_chunk} cells/chunk) workers={workers}")
     if workers <= 1:
         _CTX.clear(); _CTX.update(_ctx_light)
@@ -818,12 +818,12 @@ def extract_roi_features(
     feat_df = pd.concat([feat_df, nbr_df], axis=1)
 
     elapsed = time.time() - t_start
-    print(f"  [{sid}] v2 done: {len(feat_df)} ROIs in {elapsed:.1f}s ({elapsed/60:.1f}min)")
-    print(f"  [{sid}] v2 columns ({len(feat_df.columns)}): {list(feat_df.columns)}")
+    print(f"  [{sid}] done: {len(feat_df)} ROIs in {elapsed:.1f}s ({elapsed/60:.1f}min)")
+    print(f"  [{sid}] columns ({len(feat_df.columns)}): {list(feat_df.columns)}")
 
     if cache:
         feat_df.to_parquet(out_path, index=False)
-        print(f"  [{sid}] v2 features saved → {out_path}")
+        print(f"  [{sid}] features saved → {out_path}")
 
     meta = {
         "subject_id": sid,
@@ -845,7 +845,7 @@ def extract_roi_features(
     }
     with open(_meta_path(sid), "w") as f:
         json.dump(meta, f, indent=2)
-    print(f"  [{sid}] v2 meta saved → {_meta_path(sid)}")
+    print(f"  [{sid}] meta saved → {_meta_path(sid)}")
 
     return feat_df
 

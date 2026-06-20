@@ -1,6 +1,6 @@
-"""v4-NEW per-ROI features for the HCR ROI pass/fail classifier (S11).
+"""Surface per-ROI features for the HCR ROI pass/fail classifier (S11).
 
-Adds two families to v2+v3:
+Adds two families:
 
 1. Surface area + sphericity (per-mask geometry, no intensity needed)
    - `surface_area_um2_raw`, `surface_area_um2_opened`
@@ -8,7 +8,7 @@ Adds two families to v2+v3:
    - `sa_to_vol_um_inv_raw`,  `sa_to_vol_um_inv_opened`        (= SA/V)
    - `sphericity_raw`,        `sphericity_opened`              (in [0, 1])
 
-2. Calibrated 4-µm core/shell intensity (replaces v2's 1-voxel erosion)
+2. Calibrated 4-µm core/shell intensity (replaces the 1-voxel erosion)
    - `c405_core4um_p50_opened`, `c405_shell4um_p50_opened`
    - `c405_shell_minus_core4um_p50`
    - `c405_shell_minus_core4um_p90`

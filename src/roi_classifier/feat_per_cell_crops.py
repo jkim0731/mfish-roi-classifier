@@ -1,6 +1,6 @@
 """Per-cell padded mask-crop builder for the ROI-quality feature extractors.
 
-The surface (v4), protrusion (v5) and neighbour modules **read** a per-cell crops
+The surface, protrusion and neighbour modules **read** a per-cell crops
 parquet (`{sid}_per_cell_crops.parquet` in `MFISH_PER_CELL_CROPS_DIR`) — one
 packbits-encoded padded mask crop per cell — so they skip the slow seg-zarr label
 decode.  This module **builds** that parquet.
