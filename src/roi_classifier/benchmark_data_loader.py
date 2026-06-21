@@ -131,7 +131,13 @@ def _find_hcr_dir(subject_id: str) -> Path:
     matches = sorted(DATA_DIR.glob(f"HCR_{subject_id}_*_processed_*"))
     if not matches:
         raise FileNotFoundError(f"No HCR processed dir for {subject_id}")
-    return matches[-1]
+    # Derived assets (classifier output, human-label assets) are also named
+    # HCR_{sid}_..._processed_..._{suffix}_{ts} and match the glob — and sort AFTER the
+    # raw dir, so matches[-1] would shadow it. Prefer a dir that actually holds the raw
+    # segmentation (the centroid file _load_hcr_centroids reads); this matters in Capsule 2,
+    # where the classifier-output asset is attached alongside the raw HCR data.
+    raw = [m for m in matches if (m / "cell_body_segmentation" / "cell_centroids.npy").exists()]
+    return (raw or matches)[-1]
 
 
 def _find_czstack_reg_dir(subject_id: str) -> Path | None:
