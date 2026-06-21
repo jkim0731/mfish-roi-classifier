@@ -220,20 +220,23 @@ class _ROI:
 
 
 def _load_quality_proba(sid: str) -> pd.DataFrame:
-    """Per-ROI (_um) scores via the consolidated model + features.
+    """Per-ROI scores read from Capsule 1's proba contract (no recompute, no model).
 
-    Cols: hcr_id, score (binary positive prob), p_bad, p_bad_ok, p_good, p_merged.
+    Reads ``{sid}_roi_quality_proba.parquet`` from CACHE (= MFISH_ROI_QUALITY_DIR, the
+    attached classifier-output asset). The labeling GUI shows the SAME proba the
+    candidate list was ranked on.
+
+    Cols: hcr_id, score (= keep-prob P(good)+P(bad_ok)), p_bad, p_bad_ok, p_good, p_merged.
     """
-    from .. import features as _features, model as _model
-    feats = _features.extract_features(sid)
-    binary_score, proba4 = _model.predict(feats)
-    out = proba4.rename(
-        columns={"bad": "p_bad", "bad_ok": "p_bad_ok",
-                 "good": "p_good", "merged": "p_merged"}
-    ).copy()
-    # binary_score and proba4 are both built from feats in the same row order.
-    out["score"] = binary_score.to_numpy()
-    return out[["hcr_id", "score", "p_bad", "p_bad_ok", "p_good", "p_merged"]]
+    p = CACHE / f"{sid}_roi_quality_proba.parquet"
+    if not p.exists():
+        raise FileNotFoundError(
+            f"proba contract missing: {p}.  Attach Capsule 1's output asset and point "
+            f"MFISH_ROI_QUALITY_DIR at it (it holds {sid}_roi_quality_proba.parquet)."
+        )
+    df = pd.read_parquet(p).copy()
+    df["score"] = df["p_good"] + df["p_bad_ok"]   # keep-probability (consolidated binary head)
+    return df[["hcr_id", "score", "p_bad", "p_bad_ok", "p_good", "p_merged"]]
 
 
 def _load_quality_features(sid: str) -> pd.DataFrame:
