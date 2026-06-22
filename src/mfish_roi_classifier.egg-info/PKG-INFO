@@ -99,9 +99,10 @@ protrusion, intensity, adjacency) from them, writing one `{sid}_features_all.par
 **level-2 voxel frame** (the `orig_res` zarr the extractor indexes) and is read
 only during extraction.
 
-> The extractor optionally reads a `{sid}_stage1_score.parquet` for its
-> neighbour-adjacency features; if absent those columns are NaN (LightGBM handles
-> NaN), so cold-start still completes — not a hard prerequisite.
+> The extractor is **fully self-contained**: it needs only the segmentation
+> (`orig_res` zarr + tight-bbox cache) and the **405 nm channel** — no upstream
+> model and no other imaging channels. Cold-start is just
+> `build-bbox → build-features → predict`.
 
 ### Parallel extraction
 
@@ -137,7 +138,7 @@ training. Feature extraction is `from roi_classifier.features import extract_fea
 
 The classifier scores each segmented HCR cell into four classes — **good**,
 **bad_ok**, **bad**, **merged** — plus a binary keep score (positive = `good ∪
-bad_ok`, which is what the coregistration matcher keeps). It uses **91 features**
+bad_ok`, which is what the coregistration matcher keeps). It uses **101 features**
 in physical (µm) units, extracted per cell from the level-2 segmentation mask and
 the **405 nm channel (Rn28S — cytoplasmic ribosomal RNA, *not* a nuclear/DAPI
 stain)**, scaled by the per-subject voxel pitch. There are **no** within-subject
@@ -178,10 +179,16 @@ A real cell shows Rn28S filling its cytoplasm; junk/off-tissue ROIs do not.
 
 ### Adjacency & local density
 - **Touching:** `n_touching_neighbors`, `surface_touching_frac` (rim fraction
-  abutting any other ROI), `top_neighbor_overlap_frac`, and the touched
-  neighbours' stage-1 quality (`mean/min_touching_score_stage1`).
+  abutting any other ROI), `top_neighbor_overlap_frac`.
 - **Density:** `knn_d1` (nearest-neighbour distance, µm), `n_neighbors_30um`
   (count of other cells within 30 µm).
+- **Neighbour quality:** for each cell, the mean & min over its **6 nearest
+  neighbours** (by centroid, µm) of six "realness" features —
+  `nbr_{mean,min}_{solidity_opened, sphericity_opened, bbox_occupancy_raw,
+  frac_kept_opening, volume_um3_opened, c405_shell_minus_core_p50}`. A
+  self-contained "are the cells around me clean, real cells?" signal that
+  **replaces the retired stage-1 neighbour-score pair** — computed from this
+  model's own per-cell features, with no upstream stage-1 model.
 
 ### Protrusions
 Thin spurs that often signal an over-merge or segmentation bleed:
